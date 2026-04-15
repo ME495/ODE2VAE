@@ -10,6 +10,7 @@ dependencies = [
     "easymocap",
     "scikit-learn",
     "scipy",
+    "tensorboard",
     "torch<2.0",
     "torchdiffeq",
     "tqdm",

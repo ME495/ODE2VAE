@@ -3,12 +3,14 @@ import os
 import time
 from pathlib import Path
 from typing import Tuple
+import copy
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import MultivariateNormal, Normal
 from torch.utils import data
+from torch.utils.tensorboard import SummaryWriter
 from torchdiffeq import odeint
 from scipy.spatial.transform import Rotation
 
@@ -463,7 +465,9 @@ def build_dataloaders(args):
     )
     params = {"batch_size": args.batch_size, "shuffle": True, "num_workers": args.num_workers}
     train_loader = data.DataLoader(train_dataset, **params)
-    val_loader = data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    # Validation and test use full sequences, so batch_size=1 avoids collation errors
+    # when clips have different lengths.
+    val_loader = data.DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=args.num_workers)
     return train_dataset, val_dataset, train_loader, val_loader
 
 
@@ -480,6 +484,9 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--n-init-obs", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr-decay-factor", type=float, default=0.5)
+    parser.add_argument("--lr-decay-patience", type=int, default=3)
+    parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--method", type=str, default="rk4")
     parser.add_argument("--inst-enc", action="store_true")
     parser.add_argument("--normalize-trans", action="store_true")
@@ -487,9 +494,24 @@ def main():
     parser.add_argument("--random-mask", action="store_true")
     parser.add_argument("--random-mask-prob", type=float, default=0.15)
     parser.add_argument("--max-sequences", type=int, default=None)
+    parser.add_argument("--logdir", type=str, default="runs/ode2vae_hand")
     args = parser.parse_args()
 
     train_dataset, val_dataset, train_loader, val_loader = build_dataloaders(args)
+    logdir = Path(args.logdir).expanduser()
+    logdir.mkdir(parents=True, exist_ok=True)
+    board_dir = logdir / "board"
+    board_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logdir / "log.txt"
+    best_model_path = logdir / "best_model.pt"
+    writer = SummaryWriter(log_dir=str(board_dir))
+    log_file = log_path.open("w", encoding="utf-8")
+
+    def log(message: str) -> None:
+        print(message)
+        log_file.write(message + "\n")
+        log_file.flush()
+
     model = ODE2VAEHand(
         input_dim=train_dataset.motion_dim,
         q=args.q,
@@ -498,79 +520,143 @@ def main():
         use_global_rot=not args.disable_global_rot,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=args.lr_decay_factor,
+        patience=args.lr_decay_patience,
+        min_lr=args.min_lr,
+    )
 
-    for epoch in range(args.epochs):
-        model.train()
-        # L = 1 if epoch < args.epochs // 2 else 5
-        L = 1
-        epoch_start = time.time()
-        avg_batch_time = None
-        num_batches = len(train_loader)
-        for step, batch in enumerate(train_loader):
-            batch_start = time.time()
-            motion = batch["motion"].to(device)
-            mask = batch["mask"].to(device)
-            times = batch["times"].to(device)
+    try:
+        log("\n".join(f"{key}: {value}" for key, value in sorted(vars(args).items())))
+        writer.add_text(
+            "run/config",
+            "\n".join(f"{key}: {value}" for key, value in sorted(vars(args).items())),
+        )
+        global_step = 0
+        best_val_joint_err = float("inf")
+        best_epoch = -1
 
-            outputs = model(
-                motion,
-                mask,
-                times,
-                Ndata=len(train_dataset),
-                L=L,
-                inst_enc=args.inst_enc,
-                method=args.method,
-            )
-            elbo, lhood, kl_z, kl_w = outputs[4:]
-            loss = -elbo
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            batch_time = time.time() - batch_start
-            if avg_batch_time is None:
-                avg_batch_time = batch_time
-            else:
-                avg_batch_time = 0.9 * avg_batch_time + 0.1 * batch_time
-            remaining_batches = max(num_batches - step - 1, 0)
-            eta_seconds = remaining_batches * avg_batch_time
-            epoch_elapsed = time.time() - epoch_start
-            print(
-                f"Epoch:{epoch:03d} Step:{step:04d} "
-                f"loss:{loss.item():9.2f} "
-                f"lhood:{lhood.item():9.2f} kl_z:{kl_z.item():9.2f} kl_w:{kl_w.item():9.2f} "
-                f"batch_time:{batch_time:6.2f}s epoch_elapsed:{epoch_elapsed:7.2f}s "
-                f"epoch_eta:{eta_seconds:7.2f}s"
-            )
+        for epoch in range(args.epochs):
+            model.train()
+            # L = 1 if epoch < args.epochs // 2 else 5
+            L = 1
+            epoch_start = time.time()
+            avg_batch_time = None
+            num_batches = len(train_loader)
+            for step, batch in enumerate(train_loader):
+                batch_start = time.time()
+                motion = batch["motion"].to(device)
+                mask = batch["mask"].to(device)
+                times = batch["times"].to(device)
 
-        model.eval()
-        val_mse_sum = 0.0
-        val_batches = 0
-        for batch in val_loader:
-            motion = batch["motion"].to(device)
-            mask = batch["mask"].to(device)
-            times = batch["times"].to(device)
-            shape = batch["shape"].to(device)
-            pose = batch["pose"].to(device)
-            Rh = batch["Rh"].to(device)
-            Th = batch["Th"].to(device)
-            _, val_joint_err = model.mean_rec(
-                motion,
-                times,
-                mask=mask,
-                shape=shape,
-                pose=pose,
-                Rh=Rh,
-                Th=Th,
-                method=args.method,
-            )
-            val_mse_sum += val_joint_err.item()
-            val_batches += 1
+                outputs = model(
+                    motion,
+                    mask,
+                    times,
+                    Ndata=len(train_dataset),
+                    L=L,
+                    inst_enc=args.inst_enc,
+                    method=args.method,
+                )
+                elbo, lhood, kl_z, kl_w = outputs[4:]
+                loss = -elbo
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                batch_time = time.time() - batch_start
+                if avg_batch_time is None:
+                    avg_batch_time = batch_time
+                else:
+                    avg_batch_time = 0.9 * avg_batch_time + 0.1 * batch_time
+                remaining_batches = max(num_batches - step - 1, 0)
+                eta_seconds = remaining_batches * avg_batch_time
+                epoch_elapsed = time.time() - epoch_start
 
-        if val_batches > 0:
-            print(
-                f"Epoch:{epoch:03d} Val "
-                f"joint_err:{val_mse_sum / val_batches:9.6f}"
+                writer.add_scalar("train/loss", loss.item(), global_step)
+                writer.add_scalar("train/elbo", elbo.item(), global_step)
+                writer.add_scalar("train/lhood", lhood.item(), global_step)
+                writer.add_scalar("train/kl_z", kl_z.item(), global_step)
+                writer.add_scalar("train/kl_w", kl_w.item(), global_step)
+                writer.add_scalar("train/batch_time", batch_time, global_step)
+                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+
+                log(
+                    f"Epoch:{epoch:03d} Step:{step:04d} "
+                    f"loss:{loss.item():9.2f} "
+                    f"lhood:{lhood.item():9.2f} kl_z:{kl_z.item():9.2f} kl_w:{kl_w.item():9.2f} "
+                    f"batch_time:{batch_time:6.2f}s epoch_elapsed:{epoch_elapsed:7.2f}s "
+                    f"epoch_eta:{eta_seconds:7.2f}s"
+                )
+                global_step += 1
+
+            model.eval()
+            val_mse_sum = 0.0
+            val_batches = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    motion = batch["motion"].to(device)
+                    mask = batch["mask"].to(device)
+                    times = batch["times"].to(device)
+                    shape = batch["shape"].to(device)
+                    pose = batch["pose"].to(device)
+                    Rh = batch["Rh"].to(device)
+                    Th = batch["Th"].to(device)
+                    _, val_joint_err = model.mean_rec(
+                        motion,
+                        times,
+                        mask=mask,
+                        shape=shape,
+                        pose=pose,
+                        Rh=Rh,
+                        Th=Th,
+                        method=args.method,
+                    )
+                    val_mse_sum += val_joint_err.item()
+                    val_batches += 1
+
+            if val_batches > 0:
+                val_joint_err = val_mse_sum / val_batches
+                scheduler.step(val_joint_err)
+                writer.add_scalar("val/joint_err", val_joint_err, epoch)
+                writer.add_scalar("train/lr_epoch", optimizer.param_groups[0]["lr"], epoch)
+                if val_joint_err < best_val_joint_err:
+                    best_val_joint_err = val_joint_err
+                    best_epoch = epoch
+                    checkpoint = {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "val_joint_err": val_joint_err,
+                        "best_val_joint_err": best_val_joint_err,
+                        "args": vars(args).copy(),
+                        "model_state_dict": copy.deepcopy(model.state_dict()),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                    }
+                    torch.save(checkpoint, best_model_path)
+                    log(
+                        f"Epoch:{epoch:03d} Val joint_err:{val_joint_err:9.6f} "
+                        f"[best saved to {best_model_path}]"
+                    )
+                else:
+                    log(
+                        f"Epoch:{epoch:03d} Val joint_err:{val_joint_err:9.6f} "
+                        f"(best:{best_val_joint_err:9.6f} @ epoch {best_epoch:03d})"
+                    )
+                writer.add_scalar("val/best_joint_err", best_val_joint_err, epoch)
+
+            writer.flush()
+    finally:
+        writer.close()
+        if best_epoch >= 0:
+            log(
+                f"best epoch={best_epoch} "
+                f"val_joint_err={best_val_joint_err:.6f} "
+                f"model_path={best_model_path}"
             )
+        else:
+            log("best epoch=-1 val_joint_err=nan model_path=None")
+        log_file.close()
 
 
 if __name__ == "__main__":

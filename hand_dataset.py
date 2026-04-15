@@ -102,6 +102,7 @@ class GigaHandDataset(Dataset):
         self.fps = float(fps)
         self.max_sequences = max_sequences
         self.verbose = verbose
+        self.return_full_sequence = split in {"val", "test"}
 
         if not self.dataset_root.exists():
             raise FileNotFoundError(f"Dataset root does not exist: {self.dataset_root}")
@@ -143,7 +144,7 @@ class GigaHandDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         record = self.records[index]
-        clip = self._sample_subsequence(record)
+        clip = record if self.return_full_sequence else self._sample_subsequence(record)
         Th = clip.Th.copy()
         if self.normalize_trans:
             # Keep relative translation dynamics while removing the absolute start position.
@@ -174,7 +175,8 @@ class GigaHandDataset(Dataset):
     def __repr__(self) -> str:
         return (
             f"GigaHandDataset(num_sequences={len(self)}, seq_len={self.seq_len}, "
-            f"motion_dim={self.motion_dim}, split={self.split!r}, root='{self.dataset_root}')"
+            f"motion_dim={self.motion_dim}, split={self.split!r}, "
+            f"full_sequence={self.return_full_sequence}, root='{self.dataset_root}')"
         )
 
     def _discover_sources(self) -> List[_SequenceSource]:
