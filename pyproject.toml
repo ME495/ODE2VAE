@@ -1,0 +1,21 @@
+[project]
+name = "ode2vae-minimal"
+version = "0.1.0"
+description = "Minimal uv environment for running torch_ode2vae_minimal.py"
+requires-python = ">=3.8,<3.13"
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "easymocap",
+    "scikit-learn",
+    "scipy",
+    "torch<2.0",
+    "torchdiffeq",
+    "tqdm",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+easymocap = { path = "EasyMocap", editable = true }
