@@ -164,6 +164,89 @@ def accumulate_curve(
         counts[relative_idx] += int(frame_valid.sum().item())
 
 
+def accumulate_dynamics_curves(
+    pred_rel_joints: torch.Tensor,
+    mask: torch.Tensor,
+    times: torch.Tensor,
+    speed_sums: List[float],
+    speed_counts: List[int],
+    acc_sums: List[float],
+    acc_counts: List[int],
+    jerk_sums: List[float],
+    jerk_counts: List[int],
+) -> None:
+    if pred_rel_joints.shape[1] < 2:
+        return
+    dt = times[:, 1:] - times[:, :-1]
+    valid_vel = (mask[:, 1:] > 0) & (mask[:, :-1] > 0) & (dt > 1e-8)
+    if torch.any(valid_vel):
+        vel_dt = dt[:, :, None, None]
+        pred_vel = (pred_rel_joints[:, 1:] - pred_rel_joints[:, :-1]) / vel_dt
+        pred_speed = torch.linalg.norm(pred_vel, dim=-1).mean(dim=-1)
+        max_speed_frames = pred_speed.shape[1]
+        while len(speed_sums) < max_speed_frames:
+            speed_sums.append(0.0)
+            speed_counts.append(0)
+        for frame_idx in range(max_speed_frames):
+            frame_valid = valid_vel[:, frame_idx]
+            if not torch.any(frame_valid):
+                continue
+            frame_speed = pred_speed[frame_valid, frame_idx]
+            speed_sums[frame_idx] += float(frame_speed.sum().item())
+            speed_counts[frame_idx] += int(frame_valid.sum().item())
+
+        if pred_rel_joints.shape[1] >= 3:
+            valid_acc = valid_vel[:, 1:] & valid_vel[:, :-1]
+            if torch.any(valid_acc):
+                acc_dt = ((dt[:, 1:] + dt[:, :-1]) * 0.5)[:, :, None, None]
+                pred_acc = (pred_vel[:, 1:] - pred_vel[:, :-1]) / acc_dt
+                pred_acc_mag = torch.linalg.norm(pred_acc, dim=-1).mean(dim=-1)
+                max_acc_frames = pred_acc_mag.shape[1]
+                while len(acc_sums) < max_acc_frames:
+                    acc_sums.append(0.0)
+                    acc_counts.append(0)
+                for frame_idx in range(max_acc_frames):
+                    frame_valid = valid_acc[:, frame_idx]
+                    if not torch.any(frame_valid):
+                        continue
+                    frame_acc = pred_acc_mag[frame_valid, frame_idx]
+                    acc_sums[frame_idx] += float(frame_acc.sum().item())
+                    acc_counts[frame_idx] += int(frame_valid.sum().item())
+
+                if pred_rel_joints.shape[1] >= 4:
+                    valid_jerk = valid_acc[:, 1:] & valid_acc[:, :-1]
+                    if torch.any(valid_jerk):
+                        jerk_dt = ((acc_dt[:, 1:] + acc_dt[:, :-1]) * 0.5)
+                        pred_jerk = (pred_acc[:, 1:] - pred_acc[:, :-1]) / jerk_dt
+                        pred_jerk_mag = torch.linalg.norm(pred_jerk, dim=-1).mean(dim=-1)
+                        max_jerk_frames = pred_jerk_mag.shape[1]
+                        while len(jerk_sums) < max_jerk_frames:
+                            jerk_sums.append(0.0)
+                            jerk_counts.append(0)
+                        for frame_idx in range(max_jerk_frames):
+                            frame_valid = valid_jerk[:, frame_idx]
+                            if not torch.any(frame_valid):
+                                continue
+                            frame_jerk = pred_jerk_mag[frame_valid, frame_idx]
+                            jerk_sums[frame_idx] += float(frame_jerk.sum().item())
+                            jerk_counts[frame_idx] += int(frame_valid.sum().item())
+
+
+def summarize_curve(values: np.ndarray, prefix: str) -> Dict[str, float]:
+    data = np.asarray(values, dtype=np.float64)
+    if data.size == 0:
+        return {
+            f"{prefix}_mean": float("nan"),
+            f"{prefix}_p95": float("nan"),
+            f"{prefix}_max": float("nan"),
+        }
+    return {
+        f"{prefix}_mean": float(data.mean()),
+        f"{prefix}_p95": float(np.percentile(data, 95.0)),
+        f"{prefix}_max": float(data.max()),
+    }
+
+
 def save_curve(
     frame_numbers: np.ndarray,
     mpjpe_mm: np.ndarray,
@@ -207,6 +290,27 @@ def save_curve(
     return csv_path, json_path, png_path
 
 
+def save_scalar_curve(
+    frame_numbers: np.ndarray,
+    values: np.ndarray,
+    output_path: Path,
+    ylabel: str,
+    title: str,
+) -> Path:
+    plt.figure(figsize=(9, 5))
+    if values.size > 0:
+        plt.plot(frame_numbers, values, color="#2d6a4f", linewidth=2.2)
+        plt.scatter(frame_numbers, values, color="#264653", s=14)
+    plt.xlabel("Frame Number")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(True, linestyle="--", alpha=0.35)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+    return output_path
+
+
 def evaluate(args: argparse.Namespace) -> Dict:
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     checkpoint = load_checkpoint(checkpoint_path)
@@ -223,6 +327,12 @@ def evaluate(args: argparse.Namespace) -> Dict:
 
     errors_sum: List[float] = []
     counts: List[int] = []
+    speed_sums: List[float] = []
+    speed_counts: List[int] = []
+    acc_sums: List[float] = []
+    acc_counts: List[int] = []
+    jerk_sums: List[float] = []
+    jerk_counts: List[int] = []
 
     with torch.no_grad():
         progress = tqdm(loader, desc="Evaluating", unit="seq")
@@ -264,6 +374,17 @@ def evaluate(args: argparse.Namespace) -> Dict:
                 pred_joints, gt_joints = reconstruct_joints(model, mano_right, pred_motion, pose, rh, th, shape)
                 pred_rel_joints = to_first_frame_relative(pred_joints, mask)
                 accumulate_curve(errors_sum, counts, pred_rel_joints, gt_joints, mask)
+                accumulate_dynamics_curves(
+                    pred_rel_joints,
+                    mask,
+                    times,
+                    speed_sums,
+                    speed_counts,
+                    acc_sums,
+                    acc_counts,
+                    jerk_sums,
+                    jerk_counts,
+                )
 
     valid_pairs = [(idx + 1, errors_sum[idx] / counts[idx]) for idx in range(len(errors_sum)) if counts[idx] > 0]
     if not valid_pairs:
@@ -272,8 +393,21 @@ def evaluate(args: argparse.Namespace) -> Dict:
     frame_numbers = np.asarray([item[0] for item in valid_pairs], dtype=np.int32)
     mpjpe_m = np.asarray([item[1] for item in valid_pairs], dtype=np.float64)
     mpjpe_mm = mpjpe_m * 1000.0
+    speed_pairs = [(idx + 2, speed_sums[idx] / speed_counts[idx]) for idx in range(len(speed_sums)) if speed_counts[idx] > 0]
+    acc_pairs = [(idx + 3, acc_sums[idx] / acc_counts[idx]) for idx in range(len(acc_sums)) if acc_counts[idx] > 0]
+    jerk_pairs = [(idx + 4, jerk_sums[idx] / jerk_counts[idx]) for idx in range(len(jerk_sums)) if jerk_counts[idx] > 0]
+    speed_frame_numbers = np.asarray([item[0] for item in speed_pairs], dtype=np.int32)
+    speed_values = np.asarray([item[1] for item in speed_pairs], dtype=np.float64)
+    acc_frame_numbers = np.asarray([item[0] for item in acc_pairs], dtype=np.int32)
+    acc_values = np.asarray([item[1] for item in acc_pairs], dtype=np.float64)
+    jerk_frame_numbers = np.asarray([item[0] for item in jerk_pairs], dtype=np.int32)
+    jerk_values = np.asarray([item[1] for item in jerk_pairs], dtype=np.float64)
 
     output_dir = Path(args.output_dir).expanduser().resolve()
+    dynamics_summary: Dict[str, float] = {}
+    dynamics_summary.update(summarize_curve(speed_values, "speed"))
+    dynamics_summary.update(summarize_curve(acc_values, "acc"))
+    dynamics_summary.update(summarize_curve(jerk_values, "jerk"))
     metadata = {
         "checkpoint": str(checkpoint_path),
         "dataset_root": str(Path(dataset_root).expanduser().resolve()),
@@ -283,15 +417,53 @@ def evaluate(args: argparse.Namespace) -> Dict:
         "subseq_len": args.subseq_len,
         "stride": args.stride,
         "counts": [counts[idx] for idx in range(len(errors_sum)) if counts[idx] > 0],
+        "dynamics": dynamics_summary,
+        "speed_frame_numbers": speed_frame_numbers.tolist(),
+        "speed_values": speed_values.tolist(),
+        "acc_frame_numbers": acc_frame_numbers.tolist(),
+        "acc_values": acc_values.tolist(),
+        "jerk_frame_numbers": jerk_frame_numbers.tolist(),
+        "jerk_values": jerk_values.tolist(),
     }
     csv_path, json_path, png_path = save_curve(frame_numbers, mpjpe_mm, output_dir, metadata)
+    speed_png_path = save_scalar_curve(
+        speed_frame_numbers,
+        speed_values,
+        output_dir / "speed_magnitude_curve.png",
+        "Speed Magnitude (m/s)",
+        "GigaHands Test Set: Speed Magnitude Curve",
+    )
+    acc_png_path = save_scalar_curve(
+        acc_frame_numbers,
+        acc_values,
+        output_dir / "acc_magnitude_curve.png",
+        "Acceleration Magnitude (m/s^2)",
+        "GigaHands Test Set: Acceleration Magnitude Curve",
+    )
+    jerk_png_path = save_scalar_curve(
+        jerk_frame_numbers,
+        jerk_values,
+        output_dir / "jerk_magnitude_curve.png",
+        "Jerk Magnitude (m/s^3)",
+        "GigaHands Test Set: Jerk Magnitude Curve",
+    )
 
     return {
         "frame_numbers": frame_numbers,
         "mpjpe_mm": mpjpe_mm,
+        "dynamics": dynamics_summary,
+        "speed_frame_numbers": speed_frame_numbers,
+        "speed_values": speed_values,
+        "acc_frame_numbers": acc_frame_numbers,
+        "acc_values": acc_values,
+        "jerk_frame_numbers": jerk_frame_numbers,
+        "jerk_values": jerk_values,
         "csv_path": csv_path,
         "json_path": json_path,
         "png_path": png_path,
+        "speed_png_path": speed_png_path,
+        "acc_png_path": acc_png_path,
+        "jerk_png_path": jerk_png_path,
         "num_sequences": len(dataset),
         "checkpoint_path": checkpoint_path,
     }
@@ -301,9 +473,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate first-frame-relative MPJPE on all length-N subsequences from the GigaHands test split."
     )
-    parser.add_argument("--checkpoint", type=str, default="runs/ode2vae_hand4/best_model.pt")
+    parser.add_argument("--checkpoint", type=str, default="runs/ode2vae_hand5/best_model.pt")
     parser.add_argument("--dataset-root", type=str, default=None)
-    parser.add_argument("--output-dir", type=str, default="runs/ode2vae_hand4/eval_test")
+    parser.add_argument("--output-dir", type=str, default="runs/ode2vae_hand5/eval_test")
     parser.add_argument("--method", type=str, default=None, help="ODE solver used for mean reconstruction.")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--subseq-len", type=int, default=150)
@@ -320,9 +492,24 @@ def main() -> None:
     print(f"frame_1_mpjpe_mm: {result['mpjpe_mm'][0]:.3f}")
     print(f"mean_mpjpe_mm: {float(np.mean(result['mpjpe_mm'])):.3f}")
     print(f"last_frame_mpjpe_mm: {result['mpjpe_mm'][-1]:.3f}")
+    print(
+        f"speed_m_per_s: mean={result['dynamics']['speed_mean']:.4f}, "
+        f"p95={result['dynamics']['speed_p95']:.4f}, max={result['dynamics']['speed_max']:.4f}"
+    )
+    print(
+        f"acc_m_per_s2: mean={result['dynamics']['acc_mean']:.4f}, "
+        f"p95={result['dynamics']['acc_p95']:.4f}, max={result['dynamics']['acc_max']:.4f}"
+    )
+    print(
+        f"jerk_m_per_s3: mean={result['dynamics']['jerk_mean']:.4f}, "
+        f"p95={result['dynamics']['jerk_p95']:.4f}, max={result['dynamics']['jerk_max']:.4f}"
+    )
     print(f"csv: {result['csv_path']}")
     print(f"json: {result['json_path']}")
     print(f"png: {result['png_path']}")
+    print(f"speed_png: {result['speed_png_path']}")
+    print(f"acc_png: {result['acc_png_path']}")
+    print(f"jerk_png: {result['jerk_png_path']}")
 
 
 if __name__ == "__main__":
