@@ -2,7 +2,7 @@ import argparse
 import os
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 import copy
 
 import torch
@@ -87,6 +87,24 @@ class MLPDecoder(nn.Module):
         return self.net(z_content)
 
 
+def build_mano_right_layer(mano_model_path: str = None) -> SMPLlayer:
+    if mano_model_path is None:
+        mano_model_path = Path(__file__).resolve().parent / "EasyMocap" / "data" / "smplx"
+    mano_model_path = str(mano_model_path)
+    return SMPLlayer(
+        os.path.join(mano_model_path, "smplh", "MANO_RIGHT.pkl"),
+        model_type="mano",
+        gender="neutral",
+        device=device,
+        regressor_path=os.path.join(mano_model_path, "J_regressor_mano_RIGHT.txt"),
+        num_pca_comps=6,
+        use_pose_blending=True,
+        use_shape_blending=True,
+        use_pca=False,
+        use_flat_mean=False,
+    )
+
+
 class ODE2VAEHand(nn.Module):
     def __init__(
         self,
@@ -95,7 +113,6 @@ class ODE2VAEHand(nn.Module):
         hidden_dim: int = 256,
         n_init_obs: int = 4,
         use_global_rot: bool = True,
-        mano_model_path: str = None,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -113,21 +130,6 @@ class ODE2VAEHand(nn.Module):
         self._zero_mean = torch.zeros(2 * q).to(device)
         self._eye_covar = torch.eye(2 * q).to(device)
         self.mvn = MultivariateNormal(self._zero_mean, self._eye_covar)
-        if mano_model_path is None:
-            mano_model_path = Path(__file__).resolve().parent / "EasyMocap" / "data" / "smplx"
-        mano_model_path = str(mano_model_path)
-        self.mano_right = SMPLlayer(
-            os.path.join(mano_model_path, "smplh", "MANO_RIGHT.pkl"),
-            model_type="mano",
-            gender="neutral",
-            device=device,
-            regressor_path=os.path.join(mano_model_path, "J_regressor_mano_RIGHT.txt"),
-            num_pca_comps=6,
-            use_pose_blending=True,
-            use_shape_blending=True,
-            use_pca=False,
-            use_flat_mean=False,
-        )
 
     def ode2vae_rhs(self, t, vs_logp, f):
         vs, logp = vs_logp
@@ -375,6 +377,7 @@ class ODE2VAEHand(nn.Module):
         gt_Th: torch.Tensor,
         gt_shape: torch.Tensor,
         mask: torch.Tensor,
+        mano_right: SMPLlayer,
     ) -> torch.Tensor:
         N, T, _ = pred_motion.shape
         pred_pose, pred_Rh, pred_Th, pred_shape = self._motion_to_mano_params(
@@ -385,7 +388,7 @@ class ODE2VAEHand(nn.Module):
         gt_Th_flat = gt_Th.reshape(N * T, 3)
         gt_shape_flat = gt_shape.reshape(N * T, -1)
 
-        pred_joints = self.mano_right(
+        pred_joints = mano_right(
             poses=pred_pose,
             shapes=pred_shape,
             Rh=pred_Rh,
@@ -393,7 +396,7 @@ class ODE2VAEHand(nn.Module):
             return_verts=False,
             return_tensor=True,
         ).view(N, T, -1, 3)
-        gt_joints = self.mano_right(
+        gt_joints = mano_right(
             poses=gt_pose_axis,
             shapes=gt_shape_flat,
             Rh=gt_Rh_axis,
@@ -413,6 +416,7 @@ class ODE2VAEHand(nn.Module):
         pose: torch.Tensor = None,
         Rh: torch.Tensor = None,
         Th: torch.Tensor = None,
+        mano_right: SMPLlayer = None,
         method: str = "dopri5",
     ):
         N, T, D = X.shape
@@ -433,10 +437,15 @@ class ODE2VAEHand(nn.Module):
         zt_mu = odeint(odef, qz0_m, times, method=method).permute(1, 0, 2)
         st_mu = zt_mu[:, :, self.q :]
         Xrec_mu = self.decoder(st_mu.contiguous().view(N * T, self.q)).view(N, T, D)
-        if shape is None or pose is None or Rh is None or Th is None:
-            raise ValueError("shape, pose, Rh, and Th are required to compute MANO joint error.")
-        joint_error = self._mano_joint_error(Xrec_mu, pose, Rh, Th, shape, mask)
+        if shape is None or pose is None or Rh is None or Th is None or mano_right is None:
+            raise ValueError("shape, pose, Rh, Th, and mano_right are required to compute MANO joint error.")
+        joint_error = self._mano_joint_error(Xrec_mu, pose, Rh, Th, shape, mask, mano_right)
         return Xrec_mu, joint_error.mean()
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        # Allow loading legacy checkpoints that embedded MANO buffers in the model state.
+        filtered = {k: v for k, v in state_dict.items() if not k.startswith("mano_right.")}
+        return super().load_state_dict(filtered, strict=strict)
 
 
 def build_dataloaders(args):
@@ -471,6 +480,41 @@ def build_dataloaders(args):
     return train_dataset, val_dataset, train_loader, val_loader
 
 
+def extract_all_subsequences(
+    batch: Dict[str, torch.Tensor],
+    subseq_len: int,
+    stride: int,
+) -> Optional[Dict[str, torch.Tensor]]:
+    total_len = int(batch["motion"].shape[1])
+    if total_len < subseq_len:
+        return None
+
+    starts = []
+    for start in range(0, total_len - subseq_len + 1, stride):
+        if float(batch["mask"][0, start].item()) <= 0:
+            continue
+        starts.append(start)
+    if not starts:
+        return None
+
+    stacked: Dict[str, torch.Tensor] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim >= 2 and value.shape[1] == total_len:
+            windows = [value[:, start : start + subseq_len] for start in starts]
+            stacked[key] = torch.cat(windows, dim=0)
+        else:
+            stacked[key] = value
+    stacked["times"] = stacked["times"] - stacked["times"][:, :1]
+    return stacked
+
+
+def move_tensor_dict_to_device(batch: Dict[str, torch.Tensor], target_device: torch.device) -> Dict[str, torch.Tensor]:
+    return {
+        key: value.to(target_device) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Vector-sequence ODE2VAE for GigaHands MANO motion.")
     parser.add_argument("dataset_root", type=str)
@@ -494,8 +538,15 @@ def main():
     parser.add_argument("--random-mask", action="store_true")
     parser.add_argument("--random-mask-prob", type=float, default=0.15)
     parser.add_argument("--max-sequences", type=int, default=None)
+    parser.add_argument("--val-stride", type=int, default=1)
+    parser.add_argument("--val-every-steps", type=int, default=0)
+    parser.add_argument("--mano-model-path", type=str, default=None)
     parser.add_argument("--logdir", type=str, default="runs/ode2vae_hand")
     args = parser.parse_args()
+    if args.val_stride <= 0:
+        raise ValueError("--val-stride must be positive")
+    if args.val_every_steps < 0:
+        raise ValueError("--val-every-steps must be non-negative")
 
     train_dataset, val_dataset, train_loader, val_loader = build_dataloaders(args)
     logdir = Path(args.logdir).expanduser()
@@ -531,6 +582,55 @@ def main():
             "scheduler_state_dict": scheduler.state_dict(),
         }
 
+    def run_validation(epoch: int, trigger_step: int) -> float:
+        model.eval()
+        val_joint_err_sum = 0.0
+        val_window_count = 0
+        val_start = time.time()
+        with torch.no_grad():
+            for batch in val_loader:
+                subsequences = extract_all_subsequences(batch, args.seq_len, args.val_stride)
+                if subsequences is None:
+                    continue
+                num_windows = int(subsequences["motion"].shape[0])
+                for start in range(0, num_windows, args.batch_size):
+                    end = min(start + args.batch_size, num_windows)
+                    clip_batch = {
+                        "motion": subsequences["motion"][start:end],
+                        "mask": subsequences["mask"][start:end],
+                        "times": subsequences["times"][start:end],
+                        "pose": subsequences["pose"][start:end],
+                        "Rh": subsequences["Rh"][start:end],
+                        "Th": subsequences["Th"][start:end],
+                        "shape": subsequences["shape"][start:end],
+                    }
+                    clip_batch = move_tensor_dict_to_device(clip_batch, device)
+                    _, val_joint_err = model.mean_rec(
+                        clip_batch["motion"],
+                        clip_batch["times"],
+                        mask=clip_batch["mask"],
+                        shape=clip_batch["shape"],
+                        pose=clip_batch["pose"],
+                        Rh=clip_batch["Rh"],
+                        Th=clip_batch["Th"],
+                        mano_right=mano_right,
+                        method=args.method,
+                    )
+                    window_count = end - start
+                    val_joint_err_sum += val_joint_err.item() * window_count
+                    val_window_count += window_count
+
+        if val_window_count == 0:
+            raise RuntimeError("Validation produced zero windows. Check seq_len/val_stride or validation split.")
+
+        val_joint_err = val_joint_err_sum / val_window_count
+        scheduler.step(val_joint_err)
+        current_lr = optimizer.param_groups[0]["lr"]
+        writer.add_scalar("val/joint_err", val_joint_err, trigger_step)
+        writer.add_scalar("train/lr_val", current_lr, trigger_step)
+        writer.add_scalar("val/runtime_sec", time.time() - val_start, trigger_step)
+        return val_joint_err
+
     model = ODE2VAEHand(
         input_dim=train_dataset.motion_dim,
         q=args.q,
@@ -538,6 +638,7 @@ def main():
         n_init_obs=args.n_init_obs,
         use_global_rot=not args.disable_global_rot,
     ).to(device)
+    mano_right = build_mano_right_layer(args.mano_model_path)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -556,6 +657,7 @@ def main():
         global_step = 0
         best_val_joint_err = float("inf")
         best_epoch = -1
+        last_val_joint_err = None
 
         for epoch in range(args.epochs):
             model.train()
@@ -609,59 +711,32 @@ def main():
                     f"epoch_eta:{eta_seconds:7.2f}s"
                 )
                 global_step += 1
-
-            model.eval()
-            val_mse_sum = 0.0
-            val_batches = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    motion = batch["motion"].to(device)
-                    mask = batch["mask"].to(device)
-                    times = batch["times"].to(device)
-                    shape = batch["shape"].to(device)
-                    pose = batch["pose"].to(device)
-                    Rh = batch["Rh"].to(device)
-                    Th = batch["Th"].to(device)
-                    _, val_joint_err = model.mean_rec(
-                        motion,
-                        times,
-                        mask=mask,
-                        shape=shape,
-                        pose=pose,
-                        Rh=Rh,
-                        Th=Th,
-                        method=args.method,
-                    )
-                    val_mse_sum += val_joint_err.item()
-                    val_batches += 1
-
-            if val_batches > 0:
-                val_joint_err = val_mse_sum / val_batches
-                scheduler.step(val_joint_err)
-                if val_joint_err < best_val_joint_err:
-                    best_val_joint_err = val_joint_err
-                    best_epoch = epoch
-                current_lr = optimizer.param_groups[0]["lr"]
-                writer.add_scalar("val/joint_err", val_joint_err, epoch)
-                writer.add_scalar("train/lr_epoch", current_lr, epoch)
-                checkpoint = build_checkpoint(epoch, val_joint_err)
-                epoch_model_path = checkpoint_dir / f"epoch_{epoch:03d}.pt"
-                torch.save(checkpoint, epoch_model_path)
-                if best_epoch == epoch:
-                    torch.save(checkpoint, best_model_path)
-                    log(
-                        f"Epoch:{epoch:03d} Val joint_err:{val_joint_err:9.6f} "
-                        f"lr:{current_lr:.6e} "
-                        f"[saved to {epoch_model_path}] [best saved to {best_model_path}]"
-                    )
-                else:
-                    log(
-                        f"Epoch:{epoch:03d} Val joint_err:{val_joint_err:9.6f} "
-                        f"lr:{current_lr:.6e} "
-                        f"[saved to {epoch_model_path}] "
-                        f"(best:{best_val_joint_err:9.6f} @ epoch {best_epoch:03d})"
-                    )
-                writer.add_scalar("val/best_joint_err", best_val_joint_err, epoch)
+                if args.val_every_steps > 0 and global_step % args.val_every_steps == 0:
+                    val_joint_err = run_validation(epoch, global_step)
+                    last_val_joint_err = val_joint_err
+                    if val_joint_err < best_val_joint_err:
+                        best_val_joint_err = val_joint_err
+                        best_epoch = epoch
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    checkpoint = build_checkpoint(epoch, val_joint_err)
+                    step_model_path = checkpoint_dir / f"step_{global_step:07d}.pt"
+                    torch.save(checkpoint, step_model_path)
+                    if best_val_joint_err == val_joint_err:
+                        torch.save(checkpoint, best_model_path)
+                        log(
+                            f"Epoch:{epoch:03d} GlobalStep:{global_step:07d} "
+                            f"Val joint_err:{val_joint_err:9.6f} lr:{current_lr:.6e} "
+                            f"[saved to {step_model_path}] [best saved to {best_model_path}]"
+                        )
+                    else:
+                        log(
+                            f"Epoch:{epoch:03d} GlobalStep:{global_step:07d} "
+                            f"Val joint_err:{val_joint_err:9.6f} lr:{current_lr:.6e} "
+                            f"[saved to {step_model_path}] "
+                            f"(best:{best_val_joint_err:9.6f} @ epoch {best_epoch:03d})"
+                        )
+                    writer.add_scalar("val/joint_err", val_joint_err, global_step)
+                    model.train()
 
             writer.flush()
     finally:
@@ -673,7 +748,8 @@ def main():
                 f"model_path={best_model_path}"
             )
         else:
-            log("best epoch=-1 val_joint_err=nan model_path=None")
+            last_val_str = "nan" if last_val_joint_err is None else f"{last_val_joint_err:.6f}"
+            log(f"best epoch=-1 val_joint_err={last_val_str} model_path=None")
         log_file.close()
 
 
