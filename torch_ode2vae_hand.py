@@ -502,6 +502,8 @@ def main():
     logdir.mkdir(parents=True, exist_ok=True)
     board_dir = logdir / "board"
     board_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = logdir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_path = logdir / "log.txt"
     best_model_path = logdir / "best_model.pt"
     writer = SummaryWriter(log_dir=str(board_dir))
@@ -511,6 +513,23 @@ def main():
         print(message)
         log_file.write(message + "\n")
         log_file.flush()
+
+    def build_checkpoint(epoch: int, val_joint_err: float) -> dict:
+        current_lr = optimizer.param_groups[0]["lr"]
+        return {
+            "epoch": epoch,
+            "next_epoch": epoch + 1,
+            "global_step": global_step,
+            "val_joint_err": val_joint_err,
+            "best_val_joint_err": best_val_joint_err,
+            "best_epoch": best_epoch,
+            "lr": current_lr,
+            "optimizer_lrs": [group["lr"] for group in optimizer.param_groups],
+            "args": vars(args).copy(),
+            "model_state_dict": copy.deepcopy(model.state_dict()),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+        }
 
     model = ODE2VAEHand(
         input_dim=train_dataset.motion_dim,
@@ -619,28 +638,27 @@ def main():
             if val_batches > 0:
                 val_joint_err = val_mse_sum / val_batches
                 scheduler.step(val_joint_err)
-                writer.add_scalar("val/joint_err", val_joint_err, epoch)
-                writer.add_scalar("train/lr_epoch", optimizer.param_groups[0]["lr"], epoch)
                 if val_joint_err < best_val_joint_err:
                     best_val_joint_err = val_joint_err
                     best_epoch = epoch
-                    checkpoint = {
-                        "epoch": epoch,
-                        "global_step": global_step,
-                        "val_joint_err": val_joint_err,
-                        "best_val_joint_err": best_val_joint_err,
-                        "args": vars(args).copy(),
-                        "model_state_dict": copy.deepcopy(model.state_dict()),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                    }
+                current_lr = optimizer.param_groups[0]["lr"]
+                writer.add_scalar("val/joint_err", val_joint_err, epoch)
+                writer.add_scalar("train/lr_epoch", current_lr, epoch)
+                checkpoint = build_checkpoint(epoch, val_joint_err)
+                epoch_model_path = checkpoint_dir / f"epoch_{epoch:03d}.pt"
+                torch.save(checkpoint, epoch_model_path)
+                if best_epoch == epoch:
                     torch.save(checkpoint, best_model_path)
                     log(
                         f"Epoch:{epoch:03d} Val joint_err:{val_joint_err:9.6f} "
-                        f"[best saved to {best_model_path}]"
+                        f"lr:{current_lr:.6e} "
+                        f"[saved to {epoch_model_path}] [best saved to {best_model_path}]"
                     )
                 else:
                     log(
                         f"Epoch:{epoch:03d} Val joint_err:{val_joint_err:9.6f} "
+                        f"lr:{current_lr:.6e} "
+                        f"[saved to {epoch_model_path}] "
                         f"(best:{best_val_joint_err:9.6f} @ epoch {best_epoch:03d})"
                     )
                 writer.add_scalar("val/best_joint_err", best_val_joint_err, epoch)
