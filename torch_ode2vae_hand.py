@@ -334,8 +334,13 @@ class ODE2VAEHand(nn.Module):
     @staticmethod
     def _rot6d_to_axis_angle(x: torch.Tensor) -> torch.Tensor:
         x = x.reshape(-1, 6)
-        a1 = F.normalize(x[:, 0:3], dim=1)
-        a2 = x[:, 3:6]
+        # `hand_dataset.py` stores the first two rotation-matrix columns after
+        # slicing `rotmat[:, :2]` and flattening in NumPy/C row-major order:
+        # [r00, r01, r10, r11, r20, r21]. Rebuild the two 3D column vectors
+        # accordingly so GT MANO meshes match the official raw-axis-angle loader.
+        a1 = torch.stack([x[:, 0], x[:, 2], x[:, 4]], dim=1)
+        a2 = torch.stack([x[:, 1], x[:, 3], x[:, 5]], dim=1)
+        a1 = F.normalize(a1, dim=1)
         b2 = F.normalize(a2 - (a1 * a2).sum(dim=1, keepdim=True) * a1, dim=1)
         b3 = torch.cross(a1, b2, dim=1)
         rotmat = torch.stack([a1, b2, b3], dim=-1).detach().cpu().numpy()
@@ -449,11 +454,15 @@ class ODE2VAEHand(nn.Module):
 
 
 def build_dataloaders(args):
+    train_text_file = args.train_text_file or args.text_file
+    val_text_file = args.val_text_file or args.text_file
+    train_split = "all" if args.train_text_file is not None else "train"
+    val_split = "all" if args.val_text_file is not None else "val"
     train_dataset = GigaHandDataset(
         dataset_root=args.dataset_root,
         seq_len=args.seq_len,
-        split="train",
-        text_file=args.text_file,
+        split=train_split,
+        text_file=train_text_file,
         normalize_trans=args.normalize_trans,
         use_global_rot=not args.disable_global_rot,
         random_mask=args.random_mask,
@@ -464,8 +473,8 @@ def build_dataloaders(args):
     val_dataset = GigaHandDataset(
         dataset_root=args.dataset_root,
         seq_len=args.seq_len,
-        split="val",
-        text_file=args.text_file,
+        split=val_split,
+        text_file=val_text_file,
         normalize_trans=args.normalize_trans,
         use_global_rot=not args.disable_global_rot,
         random_mask=False,
@@ -519,6 +528,8 @@ def main():
     parser = argparse.ArgumentParser(description="Vector-sequence ODE2VAE for GigaHands MANO motion.")
     parser.add_argument("dataset_root", type=str)
     parser.add_argument("--text-file", type=str, default=None)
+    parser.add_argument("--train-text-file", type=str, default=None)
+    parser.add_argument("--val-text-file", type=str, default=None)
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--batch-size", type=int, default=32)

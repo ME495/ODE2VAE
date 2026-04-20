@@ -25,10 +25,17 @@ def load_checkpoint(checkpoint_path: Path) -> Dict:
     return checkpoint
 
 
-def build_test_loader(dataset_root: str, checkpoint_args: Dict, num_workers: int) -> Tuple[GigaHandDataset, data.DataLoader]:
+def build_test_loader(
+    dataset_root: str,
+    checkpoint_args: Dict,
+    num_workers: int,
+    text_file: Optional[str] = None,
+) -> Tuple[GigaHandDataset, data.DataLoader]:
+    dataset_split = "all" if text_file is not None else "test"
     dataset = GigaHandDataset(
         dataset_root=dataset_root,
-        split="test",
+        split=dataset_split,
+        text_file=text_file,
         normalize_trans=bool(checkpoint_args.get("normalize_trans", False)),
         use_global_rot=not bool(checkpoint_args.get("disable_global_rot", False)),
         random_mask=False,
@@ -67,6 +74,9 @@ def reconstruct_joints(
         gt_pose,
         gt_rh,
     )
+    # `gt_pose`/`gt_rh` are stored in the dataset's row-major rot6d layout from
+    # `hand_dataset.py`, so evaluation must use the shared model decoder here
+    # rather than re-implementing a separate 6D->axis-angle conversion.
     gt_pose_axis = model._rot6d_to_axis_angle(gt_pose.reshape(n * t, -1, 6)).view(n * t, -1, 3).reshape(n * t, -1)
     gt_rh_axis = model._rot6d_to_axis_angle(gt_rh.reshape(n * t, 6)).view(n * t, 3)
     gt_th_flat = gt_th.reshape(n * t, 3)
@@ -320,7 +330,8 @@ def evaluate(args: argparse.Namespace) -> Dict:
     if dataset_root is None:
         raise ValueError("dataset_root is missing. Please pass it explicitly or keep it in the checkpoint args.")
 
-    dataset, loader = build_test_loader(dataset_root, checkpoint_args, args.num_workers)
+    test_text_file = args.test_text_file or checkpoint_args.get("test_text_file")
+    dataset, loader = build_test_loader(dataset_root, checkpoint_args, args.num_workers, text_file=test_text_file)
     model = build_model(dataset, checkpoint_args, checkpoint)
     mano_right = build_mano_right_layer(checkpoint_args.get("mano_model_path"))
     method = args.method or checkpoint_args.get("method", "rk4")
@@ -475,6 +486,7 @@ def main() -> None:
     )
     parser.add_argument("--checkpoint", type=str, default="runs/ode2vae_hand5/best_model.pt")
     parser.add_argument("--dataset-root", type=str, default=None)
+    parser.add_argument("--test-text-file", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="runs/ode2vae_hand5/eval_test")
     parser.add_argument("--method", type=str, default=None, help="ODE solver used for mean reconstruction.")
     parser.add_argument("--num-workers", type=int, default=4)

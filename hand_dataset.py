@@ -481,7 +481,11 @@ class GigaHandDataset(Dataset):
     @staticmethod
     def _axis_angle_to_rot6d(axis_angle: np.ndarray) -> np.ndarray:
         rotmat = Rotation.from_rotvec(axis_angle.reshape(1, 3)).as_matrix()[0]
-        # 6D rotation representation: first two columns of the rotation matrix.
+        # Project convention: flatten `rotmat[:, :2]` in NumPy/C row-major order,
+        # i.e. [r00, r01, r10, r11, r20, r21]. This is different from the more
+        # common column-stacked 6D layout [r00, r10, r20, r01, r11, r21], so the
+        # matching decoder in `torch_ode2vae_hand._rot6d_to_axis_angle()` must
+        # keep this exact ordering for checkpoints/evaluation to stay consistent.
         return rotmat[:, :2].reshape(-1).astype(np.float32)
 
     @staticmethod
@@ -492,7 +496,7 @@ class GigaHandDataset(Dataset):
             )
         joint_axis_angles = pose_axis_angle.reshape(-1, 3)
         rotmats = Rotation.from_rotvec(joint_axis_angles).as_matrix()
-        # Convert each joint rotation to the 6D representation and flatten back.
+        # Same row-major flattening convention as `_axis_angle_to_rot6d()`.
         return rotmats[:, :, :2].reshape(-1).astype(np.float32)
 
 
