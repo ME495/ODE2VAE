@@ -8,6 +8,7 @@ dependencies = [
     "numpy",
     "chumpy @ git+https://github.com/mattloper/chumpy.git",
     "easymocap",
+    "protobuf<5",
     "scikit-learn",
     "scipy",
     "tensorboard",

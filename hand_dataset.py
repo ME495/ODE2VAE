@@ -64,26 +64,26 @@ class GigaHandDataset(Dataset):
     2. read `hand_poses/<session>/keypoints_3d/<seq>/chosen_frames_right.json`
     3. use EasyMocap's `select_nf` to extract per-frame MANO params
 
-    Each motion vector is `[Rh_6d, pose_6d, Th]` or `[pose_6d, Th]` depending on
-    `use_global_rot`. Here both `Rh` and the MANO hand pose parameters are
-    converted from axis-angle to a 6D rotation representation before being
-    returned or concatenated into motion. MANO shape coefficients are returned
-    separately and are not included in the motion state.
+    Each motion vector is `[Rh_6d, pose_6d, Th]`. Both `Rh` and the MANO hand
+    pose parameters are converted from axis-angle to a 6D rotation
+    representation before being returned or concatenated into motion. MANO
+    shape coefficients are returned separately and are not included in the
+    motion state.
     """
 
     def __init__(
         self,
         dataset_root: str,
-        seq_len: int = 16,
         split: Optional[str] = None,
         split_ratio: Tuple[float, float, float] = (0.8, 0.1, 0.1),
         text_file: Optional[str] = None,
-        normalize_trans: bool = True,  # If True, subtract the first-frame Th so motion starts at the origin.
-        use_global_rot: bool = True,  # If True, include the MANO global hand rotation Rh in each motion vector.
         random_mask: bool = False,
         random_mask_prob: float = 0.15,
         fps: float = 30.0,
         max_sequences: Optional[int] = None,
+        history_len: int = 16,
+        horizon: int = 0,
+        time_stride_aug_max: int = 1,
         verbose: bool = True,
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
@@ -93,14 +93,14 @@ class GigaHandDataset(Dataset):
             if text_file is not None
             else self.dataset_root / "annotations_v2.jsonl"
         )
-        self.seq_len = int(seq_len)
         self.split = split
-        self.normalize_trans = normalize_trans
-        self.use_global_rot = use_global_rot
         self.random_mask = random_mask
         self.random_mask_prob = float(random_mask_prob)
         self.fps = float(fps)
         self.max_sequences = max_sequences
+        self.history_len = int(history_len)
+        self.current_horizon = int(horizon)
+        self.time_stride_aug_max = int(time_stride_aug_max)
         self.verbose = verbose
         self.return_full_sequence = split in {"val", "test"}
 
@@ -108,12 +108,16 @@ class GigaHandDataset(Dataset):
             raise FileNotFoundError(f"Dataset root does not exist: {self.dataset_root}")
         if not self.text_file.exists():
             raise FileNotFoundError(f"Annotation file not found: {self.text_file}")
-        if self.seq_len <= 0:
-            raise ValueError("seq_len must be positive")
+        if self.history_len <= 0:
+            raise ValueError("history_len must be positive")
+        if self.current_horizon < 0:
+            raise ValueError("horizon must be non-negative")
         if self.fps <= 0:
             raise ValueError("fps must be positive")
         if not 0.0 <= self.random_mask_prob <= 1.0:
             raise ValueError("random_mask_prob must be in [0, 1]")
+        if self.time_stride_aug_max <= 0:
+            raise ValueError("time_stride_aug_max must be positive")
         if split is not None and split not in {"train", "val", "test", "all"}:
             raise ValueError("split must be one of None/train/val/test/all")
         if len(split_ratio) != 3 or any(r < 0 for r in split_ratio) or sum(split_ratio) <= 0:
@@ -130,7 +134,13 @@ class GigaHandDataset(Dataset):
         if not records:
             raise RuntimeError("No valid right-hand sequences could be constructed")
 
+        self.all_records = records
         self.records = records
+        self.train_sampling_options: Optional[List[np.ndarray]] = None
+        self._applied_training_horizon: Optional[int] = None
+        if not self.return_full_sequence:
+            self.set_training_horizon(self.current_horizon)
+
         if not self.records:
             raise RuntimeError(f"Split '{self.split}' produced zero sequences")
 
@@ -142,22 +152,51 @@ class GigaHandDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
+    def set_training_horizon(self, horizon: int) -> None:
+        horizon = int(horizon)
+        if horizon < 0:
+            raise ValueError("horizon must be non-negative")
+        self.current_horizon = horizon
+        if self.return_full_sequence:
+            return
+        if self._applied_training_horizon == horizon and self.train_sampling_options is not None:
+            return
+
+        filtered_records: List[_ClipRecord] = []
+        sampling_options: List[np.ndarray] = []
+        for record in self.all_records:
+            options = self._valid_sampling_options(
+                record.mask,
+                target_len=self.history_len + self.current_horizon,
+                max_stride=self.time_stride_aug_max,
+            )
+            if options.size == 0:
+                continue
+            filtered_records.append(record)
+            sampling_options.append(options)
+        if not filtered_records:
+            raise RuntimeError(
+                f"No valid training windows found for history_len={self.history_len}, "
+                f"horizon={self.current_horizon}, max_stride={self.time_stride_aug_max}."
+            )
+        self.records = filtered_records
+        self.train_sampling_options = sampling_options
+        self._applied_training_horizon = horizon
+
     def __getitem__(self, index: int) -> Dict[str, Any]:
         record = self.records[index]
-        clip = record if self.return_full_sequence else self._sample_subsequence(record)
+        if self.return_full_sequence:
+            clip = record
+        else:
+            if self.train_sampling_options is None:
+                raise RuntimeError("Training sampling options were not initialized.")
+            clip = self._sample_training_window(record, self.train_sampling_options[index])
         Th = clip.Th.copy()
-        if self.normalize_trans:
-            # Keep relative translation dynamics while removing the absolute start position.
-            Th = Th - Th[:1]
 
         motion = self._compose_motion(clip.pose, clip.Rh, Th)
         mask = clip.mask.copy().astype(np.float32)
         if self.random_mask:
-            # Random masking drops some otherwise valid observations, but the first frame
-            # must stay valid so the ODE initial state is always anchored at t=0.
-            drop = np.random.rand(mask.shape[0]) < self.random_mask_prob
-            mask = mask * (~drop).astype(np.float32)
-            mask[0] = clip.mask[0]
+            mask = self._apply_random_mask(mask)
         return {
             "motion": torch.from_numpy(motion).float(),
             "mask": torch.from_numpy(mask).float(),
@@ -174,8 +213,8 @@ class GigaHandDataset(Dataset):
 
     def __repr__(self) -> str:
         return (
-            f"GigaHandDataset(num_sequences={len(self)}, seq_len={self.seq_len}, "
-            f"motion_dim={self.motion_dim}, split={self.split!r}, "
+            f"GigaHandDataset(num_sequences={len(self)}, history_len={self.history_len}, "
+            f"horizon={self.current_horizon}, motion_dim={self.motion_dim}, split={self.split!r}, "
             f"full_sequence={self.return_full_sequence}, root='{self.dataset_root}')"
         )
 
@@ -302,38 +341,61 @@ class GigaHandDataset(Dataset):
             motion=self._compose_motion(pose, Rh, Th),
         )
 
-    def _sample_subsequence(self, record: _ClipRecord) -> _ClipRecord:
-        total_len = len(record.frame_ids)
-        valid_start_indices = np.flatnonzero(record.mask > 0)
-        if valid_start_indices.size == 0:
-            raise RuntimeError(f"Sequence {record.sample_name} does not contain any valid frames.")
+    @staticmethod
+    def _valid_sampling_options(mask: np.ndarray, target_len: int, max_stride: int) -> np.ndarray:
+        if target_len <= 0:
+            raise ValueError("target_len must be positive.")
+        if max_stride <= 0:
+            raise ValueError("max_stride must be positive.")
 
-        if total_len >= self.seq_len:
-            max_start = total_len - self.seq_len
-            candidate_starts = valid_start_indices[valid_start_indices <= max_start]
-            if candidate_starts.size > 0:
-                start = int(np.random.choice(candidate_starts))
-                end = start + self.seq_len
-                pose = record.pose[start:end].copy()
-                Rh = record.Rh[start:end].copy()
-                Th = record.Th[start:end].copy()
-                shape = record.shape[start:end].copy()
-                mask = record.mask[start:end].copy()
-                frame_ids = record.frame_ids[start:end]
-                times = record.times[start:end].copy()
-                times = times - times[0]
-            else:
-                start = int(valid_start_indices[0])
-                pose, Rh, Th, shape, mask, frame_ids, times = self._slice_and_pad_from_start(record, start)
-        else:
-            start = int(valid_start_indices[0])
-            pose, Rh, Th, shape, mask, frame_ids, times = self._slice_and_pad_from_start(record, start)
+        valid = mask > 0
+        target_offsets = np.arange(target_len, dtype=np.int64)
+        options: List[np.ndarray] = []
+        total_len = mask.shape[0]
+        for stride in range(1, max_stride + 1):
+            span = 1 + (target_len - 1) * stride
+            if span > total_len:
+                break
+            starts = np.arange(total_len - span + 1, dtype=np.int64)
+            idx = starts[:, None] + stride * target_offsets[None, :]
+            is_valid = valid[idx].all(axis=1)
+            valid_starts = starts[is_valid]
+            if valid_starts.size == 0:
+                continue
+            stride_column = np.full((valid_starts.shape[0], 1), stride, dtype=np.int64)
+            options.append(np.concatenate([valid_starts[:, None], stride_column], axis=1))
+
+        if not options:
+            return np.empty((0, 2), dtype=np.int64)
+        return np.concatenate(options, axis=0)
+
+    def _sample_training_window(self, record: _ClipRecord, sampling_options: np.ndarray) -> _ClipRecord:
+        target_len = self.history_len + self.current_horizon
+        if target_len <= 0:
+            raise RuntimeError("Target training window length must be positive.")
+        if sampling_options.size == 0:
+            raise RuntimeError(
+                f"Sequence {record.sample_name} has no valid sampling options for target length {target_len}."
+            )
+        choice = sampling_options[np.random.randint(0, sampling_options.shape[0])]
+        start = int(choice[0])
+        stride = int(choice[1])
+        idx = start + stride * np.arange(target_len, dtype=np.int64)
+
+        pose = record.pose[idx].copy()
+        Rh = record.Rh[idx].copy()
+        Th = record.Th[idx].copy()
+        shape = record.shape[idx].copy()
+        mask = record.mask[idx].copy()
+        frame_ids = tuple(record.frame_ids[i] for i in idx.tolist())
+        times = record.times[idx].copy()
+        times = times - times[0]
 
         return _ClipRecord(
             sample_name=record.sample_name,
             session_name=record.session_name,
             seq_id=record.seq_id,
-            frame_ids=tuple(frame_ids),
+            frame_ids=frame_ids,
             times=times.astype(np.float32),
             mask=mask.astype(np.float32),
             pose=pose.astype(np.float32),
@@ -343,47 +405,27 @@ class GigaHandDataset(Dataset):
             motion=self._compose_motion(pose, Rh, Th),
         )
 
-    def _slice_and_pad_from_start(self, record: _ClipRecord, start: int):
-        pose_base = record.pose[start:].copy()
-        Rh_base = record.Rh[start:].copy()
-        Th_base = record.Th[start:].copy()
-        shape_base = record.shape[start:].copy()
-        mask_base = record.mask[start:].copy()
-        frame_ids_base = record.frame_ids[start:]
-        times_base = record.times[start:].copy()
-        times_base = times_base - times_base[0]
+    def _apply_random_mask(self, mask: np.ndarray) -> np.ndarray:
+        if self.return_full_sequence:
+            return mask
+        history_len = self.history_len
+        target_len = history_len + self.current_horizon
+        if mask.shape[0] != target_len:
+            raise RuntimeError(
+                f"Random-mask expects length {target_len}, got {mask.shape[0]}."
+            )
 
-        current_len = len(frame_ids_base)
-        pad_len = self.seq_len - current_len
-        pose = np.concatenate(
-            [pose_base, np.zeros((pad_len, record.pose.shape[1]), dtype=np.float32)],
-            axis=0,
-        )
-        Rh = np.concatenate(
-            [Rh_base, np.zeros((pad_len, record.Rh.shape[1]), dtype=np.float32)],
-            axis=0,
-        )
-        Th = np.concatenate(
-            [Th_base, np.zeros((pad_len, record.Th.shape[1]), dtype=np.float32)],
-            axis=0,
-        )
-        shape = np.concatenate(
-            [shape_base, np.zeros((pad_len, record.shape.shape[1]), dtype=np.float32)],
-            axis=0,
-        )
-        mask = np.concatenate(
-            [mask_base, np.zeros((pad_len,), dtype=np.float32)],
-            axis=0,
-        )
-        last_frame_id = frame_ids_base[-1]
-        padded_frame_ids = tuple(last_frame_id + i + 1 for i in range(pad_len))
-        frame_ids = frame_ids_base + padded_frame_ids
-        if pad_len > 0:
-            padded_times = times_base[-1] + np.arange(1, pad_len + 1, dtype=np.float32) / self.fps
-            times = np.concatenate([times_base, padded_times], axis=0)
-        else:
-            times = times_base
-        return pose, Rh, Th, shape, mask, frame_ids, times
+        masked = mask.copy()
+        if history_len > 2:
+            candidate = np.arange(1, history_len - 1, dtype=np.int64)
+            drop = np.random.rand(candidate.shape[0]) < self.random_mask_prob
+            masked[candidate[drop]] = 0.0
+
+        # Keep the history anchor and all future supervision valid.
+        masked[0] = mask[0]
+        masked[history_len - 1] = mask[history_len - 1]
+        masked[history_len:] = mask[history_len:]
+        return masked.astype(np.float32)
 
     def _compose_motion(
         self,
@@ -391,10 +433,7 @@ class GigaHandDataset(Dataset):
         Rh: np.ndarray,
         Th: np.ndarray,
     ) -> np.ndarray:
-        parts = [pose, Th]
-        if self.use_global_rot:
-            # Prepend the global rigid-hand rotation in 6D form for stable NN input/output behavior.
-            parts.insert(0, Rh)
+        parts = [Rh, pose, Th]
         return np.concatenate(parts, axis=-1).astype(np.float32)
 
     def _apply_split(self, items: List[T]) -> List[T]:
@@ -504,12 +543,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Quick sanity check for GigaHandDataset.")
     parser.add_argument("dataset_root", type=str, help="Path to the GigaHands dataset root.")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test", "all"])
-    parser.add_argument("--seq-len", type=int, default=16, dest="seq_len")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--text-file", type=str, default=None, dest="text_file")
+    parser.add_argument("--history-len", type=int, default=16)
+    parser.add_argument("--horizon", type=int, default=0)
     parser.add_argument("--index", type=int, default=0, help="Sample index to inspect.")
-    parser.add_argument("--normalize-trans", action="store_true")
-    parser.add_argument("--disable-global-rot", action="store_true")
     parser.add_argument("--random-mask", action="store_true")
     parser.add_argument("--random-mask-prob", type=float, default=0.15)
     parser.add_argument("--quiet", action="store_true", help="Disable tqdm loading output.")
@@ -517,14 +555,13 @@ if __name__ == "__main__":
 
     dataset = GigaHandDataset(
         dataset_root=args.dataset_root,
-        seq_len=args.seq_len,
         split=args.split,
         text_file=args.text_file,
-        normalize_trans=args.normalize_trans,
-        use_global_rot=not args.disable_global_rot,
         random_mask=args.random_mask,
         random_mask_prob=args.random_mask_prob,
         fps=args.fps,
+        history_len=args.history_len,
+        horizon=args.horizon,
         verbose=not args.quiet,
     )
 
