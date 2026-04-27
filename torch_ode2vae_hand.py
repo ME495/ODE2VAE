@@ -116,6 +116,14 @@ def weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return (values * weights).sum() / denom
 
 
+def mse_feature_mean(pred: torch.Tensor, target: torch.Tensor, dim) -> torch.Tensor:
+    return F.mse_loss(pred, target, reduction="none").mean(dim=dim)
+
+
+def smooth_l1_feature_mean(pred: torch.Tensor, target: torch.Tensor, dim) -> torch.Tensor:
+    return F.smooth_l1_loss(pred, target, reduction="none").mean(dim=dim)
+
+
 def path_differences(
     x: torch.Tensor,
     valid: torch.Tensor,
@@ -761,8 +769,8 @@ class ODE2VAEHand(nn.Module):
         init_state_loss = weighted_mean(init_pose_loss, (targets["mask"][:, anchor_idx] > 0).to(gt_pose0.dtype))
 
         init_vel_error = (
-            (init_state["nu0"] - gt_nu0).abs().mean(dim=-1)
-            + (init_state["omega0"] - gt_omega0).abs().mean(dim=-1)
+            smooth_l1_feature_mean(init_state["nu0"], gt_nu0, dim=-1)
+            + smooth_l1_feature_mean(init_state["omega0"], gt_omega0, dim=-1)
         )
         init_vel_loss = weighted_mean(init_vel_error, vel_valid)
 
@@ -774,17 +782,17 @@ class ODE2VAEHand(nn.Module):
             future_weights,
         )
         pose_loss = weighted_mean(self._pose_geodesic(pred_pose_future, gt_pose_future), future_weights)
-        delta_p_loss = weighted_mean((pred_delta_p_future - gt_delta_p_future).abs().mean(dim=-1), future_weights)
-        nu_loss = weighted_mean((pred_nu_future - gt_nu_future).abs().mean(dim=-1), future_weights)
-        omega_loss = weighted_mean((pred_omega_future - gt_omega_future).abs().mean(dim=-1), future_weights)
+        delta_p_loss = weighted_mean(smooth_l1_feature_mean(pred_delta_p_future, gt_delta_p_future, dim=-1), future_weights)
+        nu_loss = weighted_mean(smooth_l1_feature_mean(pred_nu_future, gt_nu_future, dim=-1), future_weights)
+        omega_loss = weighted_mean(smooth_l1_feature_mean(pred_omega_future, gt_omega_future, dim=-1), future_weights)
 
-        joint_loss = (pred_joints_future - gt_joints_future).abs().mean(dim=(-1, -2))
+        joint_loss = smooth_l1_feature_mean(pred_joints_future, gt_joints_future, dim=(-1, -2))
         joint_loss = weighted_mean(joint_loss, future_weights)
 
         vert_loss = pred_pose_future.new_tensor(0.0)
         if need_verts and pred_verts_future is not None and gt_verts_future is not None:
             vert_loss = weighted_mean(
-                (pred_verts_future - gt_verts_future).abs().mean(dim=(-1, -2)),
+                smooth_l1_feature_mean(pred_verts_future, gt_verts_future, dim=(-1, -2)),
                 future_weights,
             )
 
@@ -815,9 +823,9 @@ class ODE2VAEHand(nn.Module):
         gt_joint_vel, _ = path_differences(gt_path_joints, path_mask, future_dt)
 
         vel_loss = (
-            weighted_mean((pred_pose_vel - gt_pose_vel).abs().mean(dim=-1), pose_pair_mask)
-            + weighted_mean((pred_trans_vel - gt_trans_vel).abs().mean(dim=-1), trans_pair_mask)
-            + weighted_mean((pred_joint_vel - gt_joint_vel).abs().mean(dim=(-1, -2)), joint_pair_mask)
+            weighted_mean(smooth_l1_feature_mean(pred_pose_vel, gt_pose_vel, dim=-1), pose_pair_mask)
+            + weighted_mean(smooth_l1_feature_mean(pred_trans_vel, gt_trans_vel, dim=-1), trans_pair_mask)
+            + weighted_mean(smooth_l1_feature_mean(pred_joint_vel, gt_joint_vel, dim=(-1, -2)), joint_pair_mask)
         )
 
         kl_z = self._kl_z_loss(stats)

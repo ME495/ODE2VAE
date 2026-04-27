@@ -15,7 +15,8 @@ import torch
 from matplotlib import animation
 from matplotlib.lines import Line2D
 
-from evaluate_hand import build_model, build_test_loader, load_checkpoint
+from evaluate_hand import build_model, load_checkpoint
+from hand_dataset import GigaHandDataset
 from torch_ode2vae_hand import build_mano_right_layer, device
 
 
@@ -61,25 +62,82 @@ def move_tensor_dict_to_device(batch: Dict[str, torch.Tensor], target_device: to
     return {key: value.to(target_device) if torch.is_tensor(value) else value for key, value in batch.items()}
 
 
+def checkpoint_arg(checkpoint_args: object, key: str, default=None):
+    if isinstance(checkpoint_args, dict):
+        return checkpoint_args.get(key, default)
+    return getattr(checkpoint_args, key, default)
+
+
+def build_visualization_dataset(
+    args: argparse.Namespace,
+    dataset_root: str,
+    checkpoint_args: object,
+) -> GigaHandDataset:
+    split_text_keys = {
+        "train": "train_text_file",
+        "val": "val_text_file",
+        "test": "test_text_file",
+        "all": "text_file",
+    }
+    text_file = args.test_text_file or checkpoint_arg(
+        checkpoint_args,
+        split_text_keys[args.split],
+    )
+    dataset_split = "all" if text_file is not None else args.split
+    dataset = GigaHandDataset(
+        dataset_root=dataset_root,
+        split=dataset_split,
+        text_file=text_file,
+        random_mask=False,
+        fps=float(checkpoint_arg(checkpoint_args, "fps", 30.0)),
+        max_sequences=args.max_sequences,
+        history_len=int(checkpoint_arg(checkpoint_args, "history_len", 10)),
+        horizon=int(checkpoint_arg(checkpoint_args, "horizon", 5)),
+        time_stride_aug_max=1,
+        verbose=not args.quiet_dataset,
+    )
+    dataset.return_full_sequence = True
+    dataset.records = dataset.all_records
+    return dataset
+
+
+def batchify_sample(sample: Dict[str, object]) -> Dict[str, object]:
+    batch: Dict[str, object] = {}
+    for key, value in sample.items():
+        if torch.is_tensor(value) and value.ndim >= 1:
+            batch[key] = value.unsqueeze(0)
+        else:
+            batch[key] = value
+    return batch
+
+
 def select_window(
     batch: Dict[str, torch.Tensor],
     window_len: int,
     history_len: int,
+    window_stride: int,
     start_frame: Optional[int],
     start_frame_id: Optional[int],
 ) -> Dict[str, torch.Tensor]:
+    if window_stride <= 0:
+        raise ValueError("window_stride must be positive.")
     total_len = int(batch["pose"].shape[1])
-    if total_len < window_len:
-        raise RuntimeError(f"Sequence length {total_len} is shorter than required window length {window_len}.")
+    span = 1 + (window_len - 1) * window_stride
+    if total_len < span:
+        raise RuntimeError(
+            f"Sequence length {total_len} is shorter than required window span {span} "
+            f"(window_len={window_len}, window_stride={window_stride})."
+        )
 
     mask = batch["mask"][0]
     frame_ids = batch["frame_ids"][0]
     valid_starts: List[int] = []
-    for start in range(0, total_len - window_len + 1):
-        anchor = start + history_len - 1
+    future_offsets = window_stride * torch.arange(history_len, window_len, device=mask.device)
+    for start in range(0, total_len - span + 1):
+        anchor = start + (history_len - 1) * window_stride
         if float(mask[anchor].item()) <= 0:
             continue
-        if float(mask[anchor + 1 : start + window_len].sum().item()) <= 0:
+        if float(mask[start + future_offsets].sum().item()) <= 0:
             continue
         valid_starts.append(start)
     if not valid_starts:
@@ -89,8 +147,10 @@ def select_window(
     valid_start_hint = f"Valid start examples: {valid_starts[:10]}"
     start = valid_starts[0]
     if start_frame is not None:
-        if start_frame < 0 or start_frame + window_len > total_len:
-            raise ValueError(f"--start-frame must allow a full {window_len}-frame window.")
+        if start_frame < 0 or start_frame + span > total_len:
+            raise ValueError(
+                f"--start-frame {start_frame} does not allow a full window span of {span} frames."
+            )
         start = int(start_frame)
         if start not in valid_start_set:
             raise ValueError(
@@ -105,19 +165,21 @@ def select_window(
                 f"Valid frame_id range: [{int(frame_ids[0].item())}, {int(frame_ids[-1].item())}]"
             )
         start = int(matches[0].item())
-        if start + window_len > total_len:
-            raise ValueError(f"--start-frame-id {start_frame_id} does not allow a full {window_len}-frame window.")
+        if start + span > total_len:
+            raise ValueError(
+                f"--start-frame-id {start_frame_id} does not allow a full window span of {span} frames."
+            )
         if start not in valid_start_set:
             raise ValueError(
                 f"--start-frame-id {start_frame_id} maps to start index {start}, "
                 f"which is not a valid history+horizon window. {valid_start_hint}"
             )
 
-    end = start + window_len
+    indices = start + window_stride * torch.arange(window_len, device=frame_ids.device)
     clipped: Dict[str, torch.Tensor] = {}
     for key, value in batch.items():
         if torch.is_tensor(value) and value.ndim >= 2 and value.shape[1] == total_len:
-            clipped[key] = value[:, start:end]
+            clipped[key] = value.index_select(1, indices)
         else:
             clipped[key] = value
     clipped["times"] = clipped["times"] - clipped["times"][:, :1]
@@ -169,7 +231,7 @@ def predict_outputs(
         clip_batch["times"][:, history_len : history_len + horizon]
         - clip_batch["times"][:, history_len - 1 : history_len + horizon - 1]
     ).clamp_min(1e-6)
-    stats = model._encode_initial_distribution(history["feature"])
+    stats = model._encode_initial_distribution(history_feature=history["feature"])
     init_state = model._sample_initial_state(stats, sample=sample_initial)
     rollout = model._rollout(
         init_state,
@@ -645,29 +707,31 @@ def evaluate_sequence(args: argparse.Namespace) -> Dict[str, object]:
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     checkpoint = load_checkpoint(checkpoint_path)
     checkpoint_args = checkpoint["args"]
-    dataset_root = args.dataset_root or checkpoint_args.get("dataset_root")
+    dataset_root = args.dataset_root or checkpoint_arg(checkpoint_args, "dataset_root")
     if dataset_root is None:
         raise ValueError("dataset_root is missing. Please pass it explicitly or keep it in the checkpoint args.")
 
-    test_text_file = args.test_text_file or checkpoint_args.get("test_text_file")
-    dataset, _ = build_test_loader(dataset_root, checkpoint_args, args.num_workers, text_file=test_text_file)
+    dataset = build_visualization_dataset(args, dataset_root, checkpoint_args)
     if args.sequence_index < 0 or args.sequence_index >= len(dataset):
         raise IndexError(f"--sequence-index must be in [0, {len(dataset) - 1}], got {args.sequence_index}")
 
     model = build_model(dataset, checkpoint_args, checkpoint)
-    mano_right = build_mano_right_layer(checkpoint_args.get("mano_model_path"))
-    method = args.method or checkpoint_args.get("method", "rk4")
+    mano_right = build_mano_right_layer(checkpoint_arg(checkpoint_args, "mano_model_path"))
+    method = args.method or checkpoint_arg(checkpoint_args, "method", "rk4")
     history_len = model.history_len
     horizon = model.horizon
     window_len = history_len + horizon
 
-    batch = dataset[args.sequence_index]
-    batch = {
-        key: value.unsqueeze(0) if torch.is_tensor(value) and value.ndim >= 1 and key not in {"seq_id"} else value
-        for key, value in batch.items()
-    }
+    batch = batchify_sample(dataset[args.sequence_index])
     full_frame_ids = batch["frame_ids"][0].detach().cpu().numpy()
-    batch = select_window(batch, window_len, history_len, args.start_frame, args.start_frame_id)
+    batch = select_window(
+        batch,
+        window_len=window_len,
+        history_len=history_len,
+        window_stride=args.window_stride,
+        start_frame=args.start_frame,
+        start_frame_id=args.start_frame_id,
+    )
     sample_name = batch["sample_name"]
     frame_ids = batch["frame_ids"][0].detach().cpu().numpy()
     window_start_index = int(np.where(full_frame_ids == frame_ids[0])[0][0])
@@ -855,6 +919,7 @@ def evaluate_sequence(args: argparse.Namespace) -> Dict[str, object]:
         "history_len": history_len,
         "horizon": horizon,
         "window_len": window_len,
+        "window_stride": args.window_stride,
         "window_start_index": window_start_index,
         "valid_frame_count": int(valid_mask.sum().item()),
         "future_valid_frame_count": int(future_valid_mask.sum().item()),
@@ -899,9 +964,18 @@ def main() -> None:
     parser.add_argument("--dataset-root", type=str, default=None)
     parser.add_argument("--test-text-file", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="runs/ode2vae_hand_bnn_elbo/visualize")
+    parser.add_argument("--split", type=str, default="test", choices=("train", "val", "test", "all"))
+    parser.add_argument("--max-sequences", type=int, default=None)
+    parser.add_argument("--quiet-dataset", action="store_true", help="Disable dataset loading progress output.")
     parser.add_argument("--sequence-index", type=int, default=0)
     parser.add_argument("--start-frame", type=int, default=None, help="Start from this in-sequence frame index.")
     parser.add_argument("--start-frame-id", type=int, default=None, help="Start from this original dataset frame_id.")
+    parser.add_argument(
+        "--window-stride",
+        type=int,
+        default=1,
+        help="Select every Nth frame inside the visualization window.",
+    )
     parser.add_argument("--sample-count", type=int, default=12)
     parser.add_argument("--visible-samples", type=int, default=4)
     parser.add_argument("--gif-fps", type=int, default=12)
@@ -915,7 +989,12 @@ def main() -> None:
         help="Axis modes to render in the axis comparison figure.",
     )
     parser.add_argument("--method", type=str, default=None)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Kept for CLI compatibility; visualization loads samples in-process.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sample-z0", action="store_true", help="Sample the latent initial state in addition to BNN weights.")
     parser.add_argument("--export-obj", action="store_true", help="Export MANO meshes as OBJ sequences for inspection.")
@@ -931,6 +1010,10 @@ def main() -> None:
         raise ValueError("--gif-fps must be positive")
     if args.trail_length <= 0:
         raise ValueError("--trail-length must be positive")
+    if args.window_stride <= 0:
+        raise ValueError("--window-stride must be positive")
+    if args.max_sequences is not None and args.max_sequences <= 0:
+        raise ValueError("--max-sequences must be positive when provided")
     if args.start_frame is not None and args.start_frame_id is not None:
         raise ValueError("Please specify only one of --start-frame or --start-frame-id")
     if args.obj_frame_step <= 0:
@@ -948,6 +1031,7 @@ def main() -> None:
     print(f"history_len: {result['history_len']}")
     print(f"horizon: {result['horizon']}")
     print(f"window_len: {result['window_len']}")
+    print(f"window_stride: {result['window_stride']}")
     print(f"valid_frame_count: {result['valid_frame_count']}")
     print(f"future_valid_frame_count: {result['future_valid_frame_count']}")
     print(f"sample_count: {result['sample_count']}")

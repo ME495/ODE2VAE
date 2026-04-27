@@ -316,6 +316,75 @@ def save_comparison_curve(
     return output_path
 
 
+def save_speed_comparison(
+    pred_frame_numbers: np.ndarray,
+    pred_speed: np.ndarray,
+    gt_frame_numbers: np.ndarray,
+    gt_speed: np.ndarray,
+    output_dir: Path,
+    metadata: Dict,
+) -> Tuple[Path, Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "future_speed_comparison.csv"
+    json_path = output_dir / "future_speed_comparison.json"
+    png_path = output_dir / "future_speed_comparison.png"
+
+    pred_by_frame = {
+        int(frame): float(value)
+        for frame, value in zip(pred_frame_numbers.tolist(), pred_speed.tolist())
+    }
+    gt_by_frame = {
+        int(frame): float(value)
+        for frame, value in zip(gt_frame_numbers.tolist(), gt_speed.tolist())
+    }
+    all_frames = sorted(set(pred_by_frame) | set(gt_by_frame))
+
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["frame", "pred_speed_m_per_s", "gt_speed_m_per_s"])
+        for frame in all_frames:
+            writer.writerow([frame, pred_by_frame.get(frame, ""), gt_by_frame.get(frame, "")])
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                **metadata,
+                "pred_speed_frame_numbers": pred_frame_numbers.tolist(),
+                "pred_speed_m_per_s": pred_speed.tolist(),
+                "gt_speed_frame_numbers": gt_frame_numbers.tolist(),
+                "gt_speed_m_per_s": gt_speed.tolist(),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    plt.figure(figsize=(9, 5))
+    if gt_speed.size > 0:
+        plt.plot(
+            gt_frame_numbers,
+            gt_speed,
+            color="#1f3b73",
+            linewidth=2.2,
+            linestyle="--",
+            label="Ground truth",
+        )
+        plt.scatter(gt_frame_numbers, gt_speed, color="#1f3b73", s=14)
+    if pred_speed.size > 0:
+        plt.plot(pred_frame_numbers, pred_speed, color="#d04a35", linewidth=2.2, label="Prediction")
+        plt.scatter(pred_frame_numbers, pred_speed, color="#d04a35", s=14)
+    plt.xlabel("Prediction Step")
+    plt.ylabel("Mean Joint Speed (m/s)")
+    plt.title("GigaHands Test Set: Prediction vs Ground-Truth Speed")
+    plt.grid(True, linestyle="--", alpha=0.35)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=200)
+    plt.close()
+
+    return csv_path, json_path, png_path
+
+
 def evaluate(args: argparse.Namespace) -> Dict:
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     checkpoint = load_checkpoint(checkpoint_path)
@@ -342,6 +411,12 @@ def evaluate(args: argparse.Namespace) -> Dict:
     acc_counts: List[int] = []
     jerk_sums: List[float] = []
     jerk_counts: List[int] = []
+    gt_speed_sums: List[float] = []
+    gt_speed_counts: List[int] = []
+    gt_acc_sums: List[float] = []
+    gt_acc_counts: List[int] = []
+    gt_jerk_sums: List[float] = []
+    gt_jerk_counts: List[int] = []
     baseline_errors_sum: List[float] = []
     baseline_counts: List[int] = []
     baseline_speed_sums: List[float] = []
@@ -423,6 +498,17 @@ def evaluate(args: argparse.Namespace) -> Dict:
                     jerk_counts,
                 )
                 accumulate_dynamics_curves(
+                    gt_joints,
+                    future_mask,
+                    future_times,
+                    gt_speed_sums,
+                    gt_speed_counts,
+                    gt_acc_sums,
+                    gt_acc_counts,
+                    gt_jerk_sums,
+                    gt_jerk_counts,
+                )
+                accumulate_dynamics_curves(
                     baseline_joints,
                     future_mask,
                     future_times,
@@ -444,6 +530,9 @@ def evaluate(args: argparse.Namespace) -> Dict:
     speed_frame_numbers, speed_values = curve_pairs(speed_sums, speed_counts, start_frame=2)
     acc_frame_numbers, acc_values = curve_pairs(acc_sums, acc_counts, start_frame=3)
     jerk_frame_numbers, jerk_values = curve_pairs(jerk_sums, jerk_counts, start_frame=4)
+    gt_speed_frame_numbers, gt_speed_values = curve_pairs(gt_speed_sums, gt_speed_counts, start_frame=2)
+    gt_acc_frame_numbers, gt_acc_values = curve_pairs(gt_acc_sums, gt_acc_counts, start_frame=3)
+    gt_jerk_frame_numbers, gt_jerk_values = curve_pairs(gt_jerk_sums, gt_jerk_counts, start_frame=4)
     baseline_speed_frame_numbers, baseline_speed_values = curve_pairs(
         baseline_speed_sums,
         baseline_speed_counts,
@@ -465,6 +554,10 @@ def evaluate(args: argparse.Namespace) -> Dict:
     dynamics_summary.update(summarize_curve(speed_values, "speed"))
     dynamics_summary.update(summarize_curve(acc_values, "acc"))
     dynamics_summary.update(summarize_curve(jerk_values, "jerk"))
+    gt_dynamics_summary: Dict[str, float] = {}
+    gt_dynamics_summary.update(summarize_curve(gt_speed_values, "speed"))
+    gt_dynamics_summary.update(summarize_curve(gt_acc_values, "acc"))
+    gt_dynamics_summary.update(summarize_curve(gt_jerk_values, "jerk"))
     baseline_dynamics_summary: Dict[str, float] = {}
     baseline_dynamics_summary.update(summarize_curve(baseline_speed_values, "speed"))
     baseline_dynamics_summary.update(summarize_curve(baseline_acc_values, "acc"))
@@ -481,6 +574,7 @@ def evaluate(args: argparse.Namespace) -> Dict:
         "stride": args.stride,
         "counts": [counts[idx] for idx in range(len(errors_sum)) if counts[idx] > 0],
         "dynamics": dynamics_summary,
+        "gt_dynamics": gt_dynamics_summary,
         "baseline_counts": [
             baseline_counts[idx] for idx in range(len(baseline_errors_sum)) if baseline_counts[idx] > 0
         ],
@@ -489,6 +583,12 @@ def evaluate(args: argparse.Namespace) -> Dict:
         "baseline_mpjpe_mm": baseline_mpjpe_mm.tolist(),
         "speed_frame_numbers": speed_frame_numbers.tolist(),
         "speed_values": speed_values.tolist(),
+        "gt_speed_frame_numbers": gt_speed_frame_numbers.tolist(),
+        "gt_speed_values": gt_speed_values.tolist(),
+        "gt_acc_frame_numbers": gt_acc_frame_numbers.tolist(),
+        "gt_acc_values": gt_acc_values.tolist(),
+        "gt_jerk_frame_numbers": gt_jerk_frame_numbers.tolist(),
+        "gt_jerk_values": gt_jerk_values.tolist(),
         "acc_frame_numbers": acc_frame_numbers.tolist(),
         "acc_values": acc_values.tolist(),
         "jerk_frame_numbers": jerk_frame_numbers.tolist(),
@@ -524,6 +624,14 @@ def evaluate(args: argparse.Namespace) -> Dict:
         output_dir / "speed_magnitude_curve.png",
         "Speed Magnitude (m/s)",
         "GigaHands Test Set: Speed Magnitude Curve",
+    )
+    speed_comparison_csv_path, speed_comparison_json_path, speed_comparison_png_path = save_speed_comparison(
+        speed_frame_numbers,
+        speed_values,
+        gt_speed_frame_numbers,
+        gt_speed_values,
+        output_dir,
+        metadata,
     )
     acc_png_path = save_scalar_curve(
         acc_frame_numbers,
@@ -567,9 +675,16 @@ def evaluate(args: argparse.Namespace) -> Dict:
         "baseline_frame_numbers": baseline_frame_numbers,
         "baseline_mpjpe_mm": baseline_mpjpe_mm,
         "dynamics": dynamics_summary,
+        "gt_dynamics": gt_dynamics_summary,
         "baseline_dynamics": baseline_dynamics_summary,
         "speed_frame_numbers": speed_frame_numbers,
         "speed_values": speed_values,
+        "gt_speed_frame_numbers": gt_speed_frame_numbers,
+        "gt_speed_values": gt_speed_values,
+        "gt_acc_frame_numbers": gt_acc_frame_numbers,
+        "gt_acc_values": gt_acc_values,
+        "gt_jerk_frame_numbers": gt_jerk_frame_numbers,
+        "gt_jerk_values": gt_jerk_values,
         "acc_frame_numbers": acc_frame_numbers,
         "acc_values": acc_values,
         "jerk_frame_numbers": jerk_frame_numbers,
@@ -588,6 +703,9 @@ def evaluate(args: argparse.Namespace) -> Dict:
         "baseline_png_path": baseline_png_path,
         "comparison_png_path": comparison_png_path,
         "speed_png_path": speed_png_path,
+        "speed_comparison_csv_path": speed_comparison_csv_path,
+        "speed_comparison_json_path": speed_comparison_json_path,
+        "speed_comparison_png_path": speed_comparison_png_path,
         "acc_png_path": acc_png_path,
         "jerk_png_path": jerk_png_path,
         "baseline_speed_png_path": baseline_speed_png_path,
@@ -629,6 +747,10 @@ def main() -> None:
         f"p95={result['dynamics']['speed_p95']:.4f}, max={result['dynamics']['speed_max']:.4f}"
     )
     print(
+        f"gt_speed_m_per_s: mean={result['gt_dynamics']['speed_mean']:.4f}, "
+        f"p95={result['gt_dynamics']['speed_p95']:.4f}, max={result['gt_dynamics']['speed_max']:.4f}"
+    )
+    print(
         f"acc_m_per_s2: mean={result['dynamics']['acc_mean']:.4f}, "
         f"p95={result['dynamics']['acc_p95']:.4f}, max={result['dynamics']['acc_max']:.4f}"
     )
@@ -644,6 +766,9 @@ def main() -> None:
     print(f"baseline_png: {result['baseline_png_path']}")
     print(f"comparison_png: {result['comparison_png_path']}")
     print(f"speed_png: {result['speed_png_path']}")
+    print(f"speed_comparison_csv: {result['speed_comparison_csv_path']}")
+    print(f"speed_comparison_json: {result['speed_comparison_json_path']}")
+    print(f"speed_comparison_png: {result['speed_comparison_png_path']}")
     print(f"acc_png: {result['acc_png_path']}")
     print(f"jerk_png: {result['jerk_png_path']}")
     print(f"baseline_speed_png: {result['baseline_speed_png_path']}")
