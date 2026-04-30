@@ -116,6 +116,14 @@ def weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return (values * weights).sum() / denom
 
 
+def weighted_mean_per_sample(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    weights = weights.to(values.dtype)
+    batch_size = values.shape[0]
+    weighted = (values * weights).reshape(batch_size, -1)
+    denom = weights.reshape(batch_size, -1).sum(dim=1).clamp_min(1e-6)
+    return weighted.sum(dim=1) / denom
+
+
 def mse_feature_mean(pred: torch.Tensor, target: torch.Tensor, dim) -> torch.Tensor:
     return F.mse_loss(pred, target, reduction="none").mean(dim=dim)
 
@@ -586,7 +594,7 @@ class ODE2VAEHand(nn.Module):
         horizon = future_dt.shape[1]
         z0 = self._pack_internal_state(init_state["h0"], init_state["hdot0"], init_state["nu0"], init_state["omega0"])
         t_eval = 0.5 * torch.arange(2 * horizon + 1, device=future_dt.device, dtype=future_dt.dtype)
-        dynamics_fn = self.dynamics.draw_dynamics(mean=not sample_dynamics)
+        dynamics_fn = self.dynamics.draw_dynamics(mean=False if self.training else not sample_dynamics)
         ode_func = InternalStateODEFunc(self, future_dt, dynamics_fn)
         z_dense = odeint(
             ode_func,
@@ -654,9 +662,12 @@ class ODE2VAEHand(nn.Module):
         return mu, logvar
 
     def _kl_z_loss(self, stats: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return self._kl_z_loss_per_sample(stats).mean()
+
+    def _kl_z_loss_per_sample(self, stats: Dict[str, torch.Tensor]) -> torch.Tensor:
         mu, logvar = self._latent_stats(stats)
         kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
-        return kl.sum(dim=-1).mean()
+        return kl.sum(dim=-1)
 
     def _kl_w_loss(self) -> torch.Tensor:
         total = next(self.parameters()).new_tensor(0.0)
@@ -679,8 +690,24 @@ class ODE2VAEHand(nn.Module):
         horizon: int,
         future_discount: float,
     ) -> torch.Tensor:
+        return self._inst_kl_loss_per_sample(
+            rollout=rollout,
+            targets=targets,
+            history_len=history_len,
+            horizon=horizon,
+            future_discount=future_discount,
+        ).mean()
+
+    def _inst_kl_loss_per_sample(
+        self,
+        rollout: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        history_len: int,
+        horizon: int,
+        future_discount: float,
+    ) -> torch.Tensor:
         if horizon <= 0:
-            return rollout["z_path"].new_tensor(0.0)
+            return rollout["z_path"].new_zeros(rollout["z_path"].shape[0])
 
         inst_mu = []
         inst_logvar = []
@@ -708,7 +735,7 @@ class ODE2VAEHand(nn.Module):
         future_mask = targets["mask"][:, history_len : history_len + horizon]
         future_weights = future_discount ** torch.arange(horizon, device=future_mask.device, dtype=future_mask.dtype)
         future_weights = future_weights.view(1, -1) * future_mask
-        return weighted_mean(inst_kl, future_weights)
+        return weighted_mean_per_sample(inst_kl, future_weights)
 
     def _pose_geodesic(self, pred_pose: torch.Tensor, gt_pose: torch.Tensor) -> torch.Tensor:
         pred_mat = rot6d_rowmajor_to_matrix(pred_pose.reshape(-1, 6)).reshape(
@@ -766,31 +793,47 @@ class ODE2VAEHand(nn.Module):
         gt_omega0 = targets["root_omega"][:, anchor_idx]
 
         init_pose_loss = self._pose_geodesic(init_state["pose0"].unsqueeze(1), gt_pose0.unsqueeze(1)).squeeze(1)
-        init_state_loss = weighted_mean(init_pose_loss, (targets["mask"][:, anchor_idx] > 0).to(gt_pose0.dtype))
+        init_state_weight = (targets["mask"][:, anchor_idx] > 0).to(gt_pose0.dtype)
+        init_state_loss_per_sample = weighted_mean_per_sample(init_pose_loss.unsqueeze(1), init_state_weight.unsqueeze(1))
+        init_state_loss = weighted_mean(init_pose_loss, init_state_weight)
 
         init_vel_error = (
             smooth_l1_feature_mean(init_state["nu0"], gt_nu0, dim=-1)
             + smooth_l1_feature_mean(init_state["omega0"], gt_omega0, dim=-1)
         )
+        init_vel_loss_per_sample = weighted_mean_per_sample(init_vel_error.unsqueeze(1), vel_valid.unsqueeze(1))
         init_vel_loss = weighted_mean(init_vel_error, vel_valid)
 
-        root_rot_loss = weighted_mean(
-            geodesic_distance_from_matrices(
-                rot6d_rowmajor_to_matrix(pred_root_future.reshape(-1, 6)).reshape(-1, horizon, 3, 3),
-                rot6d_rowmajor_to_matrix(gt_root_future.reshape(-1, 6)).reshape(-1, horizon, 3, 3),
-            ),
-            future_weights,
+        root_rot_error = geodesic_distance_from_matrices(
+            rot6d_rowmajor_to_matrix(pred_root_future.reshape(-1, 6)).reshape(-1, horizon, 3, 3),
+            rot6d_rowmajor_to_matrix(gt_root_future.reshape(-1, 6)).reshape(-1, horizon, 3, 3),
         )
-        pose_loss = weighted_mean(self._pose_geodesic(pred_pose_future, gt_pose_future), future_weights)
-        delta_p_loss = weighted_mean(smooth_l1_feature_mean(pred_delta_p_future, gt_delta_p_future, dim=-1), future_weights)
-        nu_loss = weighted_mean(smooth_l1_feature_mean(pred_nu_future, gt_nu_future, dim=-1), future_weights)
-        omega_loss = weighted_mean(smooth_l1_feature_mean(pred_omega_future, gt_omega_future, dim=-1), future_weights)
+        root_rot_loss_per_sample = weighted_mean_per_sample(root_rot_error, future_weights)
+        root_rot_loss = weighted_mean(root_rot_error, future_weights)
+        pose_error = self._pose_geodesic(pred_pose_future, gt_pose_future)
+        pose_loss_per_sample = weighted_mean_per_sample(pose_error, future_weights)
+        pose_loss = weighted_mean(pose_error, future_weights)
+        delta_p_error = smooth_l1_feature_mean(pred_delta_p_future, gt_delta_p_future, dim=-1)
+        delta_p_loss_per_sample = weighted_mean_per_sample(delta_p_error, future_weights)
+        delta_p_loss = weighted_mean(delta_p_error, future_weights)
+        nu_error = smooth_l1_feature_mean(pred_nu_future, gt_nu_future, dim=-1)
+        nu_loss_per_sample = weighted_mean_per_sample(nu_error, future_weights)
+        nu_loss = weighted_mean(nu_error, future_weights)
+        omega_error = smooth_l1_feature_mean(pred_omega_future, gt_omega_future, dim=-1)
+        omega_loss_per_sample = weighted_mean_per_sample(omega_error, future_weights)
+        omega_loss = weighted_mean(omega_error, future_weights)
 
-        joint_loss = smooth_l1_feature_mean(pred_joints_future, gt_joints_future, dim=(-1, -2))
-        joint_loss = weighted_mean(joint_loss, future_weights)
+        joint_error = smooth_l1_feature_mean(pred_joints_future, gt_joints_future, dim=(-1, -2))
+        joint_loss_per_sample = weighted_mean_per_sample(joint_error, future_weights)
+        joint_loss = weighted_mean(joint_error, future_weights)
 
+        vert_loss_per_sample = torch.zeros(gt_pose0.shape[0], device=pred_pose_future.device, dtype=pred_pose_future.dtype)
         vert_loss = pred_pose_future.new_tensor(0.0)
         if need_verts and pred_verts_future is not None and gt_verts_future is not None:
+            vert_loss_per_sample = weighted_mean_per_sample(
+                smooth_l1_feature_mean(pred_verts_future, gt_verts_future, dim=(-1, -2)),
+                future_weights,
+            )
             vert_loss = weighted_mean(
                 smooth_l1_feature_mean(pred_verts_future, gt_verts_future, dim=(-1, -2)),
                 future_weights,
@@ -822,37 +865,56 @@ class ODE2VAEHand(nn.Module):
         pred_joint_vel, joint_pair_mask = path_differences(pred_path_joints, path_mask, future_dt)
         gt_joint_vel, _ = path_differences(gt_path_joints, path_mask, future_dt)
 
+        vel_loss_per_sample = (
+            weighted_mean_per_sample(smooth_l1_feature_mean(pred_pose_vel, gt_pose_vel, dim=-1), pose_pair_mask)
+            + weighted_mean_per_sample(smooth_l1_feature_mean(pred_trans_vel, gt_trans_vel, dim=-1), trans_pair_mask)
+            + weighted_mean_per_sample(smooth_l1_feature_mean(pred_joint_vel, gt_joint_vel, dim=(-1, -2)), joint_pair_mask)
+        )
         vel_loss = (
             weighted_mean(smooth_l1_feature_mean(pred_pose_vel, gt_pose_vel, dim=-1), pose_pair_mask)
             + weighted_mean(smooth_l1_feature_mean(pred_trans_vel, gt_trans_vel, dim=-1), trans_pair_mask)
             + weighted_mean(smooth_l1_feature_mean(pred_joint_vel, gt_joint_vel, dim=(-1, -2)), joint_pair_mask)
         )
 
-        kl_z = self._kl_z_loss(stats)
+        kl_z_per_sample = self._kl_z_loss_per_sample(stats)
+        kl_z = kl_z_per_sample.mean()
         kl_w = self._kl_w_loss()
-        inst_KL = self._inst_kl_loss(
+        inst_KL_per_sample = self._inst_kl_loss_per_sample(
             rollout=rollout,
             targets=targets,
             history_len=history_len,
             horizon=horizon,
             future_discount=future_discount,
         )
+        inst_KL = inst_KL_per_sample.mean()
         kl_loss = kl_z + kl_w + inst_KL
 
         return {
             "init_state_loss": init_state_loss,
+            "init_state_loss_per_sample": init_state_loss_per_sample,
             "init_vel_loss": init_vel_loss,
+            "init_vel_loss_per_sample": init_vel_loss_per_sample,
             "delta_p_loss": delta_p_loss,
+            "delta_p_loss_per_sample": delta_p_loss_per_sample,
             "root_rot_loss": root_rot_loss,
+            "root_rot_loss_per_sample": root_rot_loss_per_sample,
             "nu_loss": nu_loss,
+            "nu_loss_per_sample": nu_loss_per_sample,
             "omega_loss": omega_loss,
+            "omega_loss_per_sample": omega_loss_per_sample,
             "pose_loss": pose_loss,
+            "pose_loss_per_sample": pose_loss_per_sample,
             "joint_loss": joint_loss,
+            "joint_loss_per_sample": joint_loss_per_sample,
             "vert_loss": vert_loss,
+            "vert_loss_per_sample": vert_loss_per_sample,
             "vel_loss": vel_loss,
+            "vel_loss_per_sample": vel_loss_per_sample,
             "kl_z": kl_z,
+            "kl_z_per_sample": kl_z_per_sample,
             "kl_w": kl_w,
             "inst_KL": inst_KL,
+            "inst_KL_per_sample": inst_KL_per_sample,
             "kl_loss": kl_loss,
             "future_mask_mean": future_mask.mean(),
             "pred_joint_error": joint_loss.detach(),
@@ -862,19 +924,14 @@ class ODE2VAEHand(nn.Module):
             "future_mask": future_mask,
         }
 
-    def forward(
+    def _prepare_forward_context(
         self,
         batch: Dict[str, torch.Tensor],
         mano_right: SMPLlayer,
-        history_len: Optional[int] = None,
-        horizon: Optional[int] = None,
-        sample: bool = True,
-        method: str = "midpoint",
-        future_discount: float = 1.0,
+        history_len: int,
+        horizon: int,
         need_verts: bool = False,
-    ) -> Optional[Dict[str, torch.Tensor]]:
-        history_len = self.history_len if history_len is None else history_len
-        horizon = self.horizon if horizon is None else horizon
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         total_len = history_len + horizon
 
         pose = batch["pose"]
@@ -922,6 +979,77 @@ class ODE2VAEHand(nn.Module):
 
         stats = self._encode_initial_distribution(
             history_feature=history["feature"],
+        )
+        return targets, stats
+
+    def forward_samples(
+        self,
+        batch: Dict[str, torch.Tensor],
+        mano_right: SMPLlayer,
+        num_samples: int,
+        history_len: Optional[int] = None,
+        horizon: Optional[int] = None,
+        sample: bool = True,
+        method: str = "midpoint",
+        future_discount: float = 1.0,
+        need_verts: bool = False,
+        sample_dynamics: Optional[bool] = None,
+    ) -> List[Dict[str, torch.Tensor]]:
+        history_len = self.history_len if history_len is None else history_len
+        horizon = self.horizon if horizon is None else horizon
+        sample_dynamics = sample if sample_dynamics is None else sample_dynamics
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive.")
+        targets, stats = self._prepare_forward_context(
+            batch=batch,
+            mano_right=mano_right,
+            history_len=history_len,
+            horizon=horizon,
+            need_verts=need_verts,
+        )
+        outputs = []
+        for _ in range(num_samples):
+            init_state = self._sample_initial_state(stats, sample=sample)
+            rollout = self._rollout(
+                init_state,
+                future_dt=targets["future_dt"],
+                method=method,
+                sample_dynamics=sample_dynamics,
+            )
+            outputs.append(
+                self._compute_losses(
+                    init_state=init_state,
+                    stats=stats,
+                    rollout=rollout,
+                    targets=targets,
+                    mano_right=mano_right,
+                    history_len=history_len,
+                    horizon=horizon,
+                    future_discount=future_discount,
+                    need_verts=need_verts,
+                )
+            )
+        return outputs
+
+    def forward(
+        self,
+        batch: Dict[str, torch.Tensor],
+        mano_right: SMPLlayer,
+        history_len: Optional[int] = None,
+        horizon: Optional[int] = None,
+        sample: bool = True,
+        method: str = "midpoint",
+        future_discount: float = 1.0,
+        need_verts: bool = False,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        history_len = self.history_len if history_len is None else history_len
+        horizon = self.horizon if horizon is None else horizon
+        targets, stats = self._prepare_forward_context(
+            batch=batch,
+            mano_right=mano_right,
+            history_len=history_len,
+            horizon=horizon,
+            need_verts=need_verts,
         )
         init_state = self._sample_initial_state(stats, sample=sample)
         rollout = self._rollout(
@@ -1091,19 +1219,48 @@ def scheduled_horizon(epoch: int, args) -> int:
     return min(scheduled, args.horizon)
 
 
+RECON_LOSS_KEYS = (
+    "init_state_loss",
+    "init_vel_loss",
+    "delta_p_loss",
+    "root_rot_loss",
+    "nu_loss",
+    "omega_loss",
+    "pose_loss",
+    "joint_loss",
+    "vert_loss",
+    "vel_loss",
+)
+
+RECON_LOSS_ARG_NAMES = {
+    "init_state_loss": "lambda_init_state",
+    "init_vel_loss": "lambda_init_vel",
+    "delta_p_loss": "lambda_delta_p",
+    "root_rot_loss": "lambda_root_rot",
+    "nu_loss": "lambda_nu",
+    "omega_loss": "lambda_omega",
+    "pose_loss": "lambda_pose",
+    "joint_loss": "lambda_joint",
+    "vert_loss": "lambda_vert",
+    "vel_loss": "lambda_vel",
+}
+
+
 def compute_reconstruction_nll(losses: Dict[str, torch.Tensor], args) -> torch.Tensor:
-    return (
-        args.lambda_init_state * losses["init_state_loss"]
-        + args.lambda_init_vel * losses["init_vel_loss"]
-        + args.lambda_delta_p * losses["delta_p_loss"]
-        + args.lambda_root_rot * losses["root_rot_loss"]
-        + args.lambda_nu * losses["nu_loss"]
-        + args.lambda_omega * losses["omega_loss"]
-        + args.lambda_pose * losses["pose_loss"]
-        + args.lambda_joint * losses["joint_loss"]
-        + args.lambda_vert * losses["vert_loss"]
-        + args.lambda_vel * losses["vel_loss"]
-    )
+    total = next(iter(losses.values())).new_tensor(0.0)
+    for key in RECON_LOSS_KEYS:
+        total = total + getattr(args, RECON_LOSS_ARG_NAMES[key]) * losses[key]
+    return total
+
+
+def compute_reconstruction_nll_per_sample(losses: Dict[str, torch.Tensor], args) -> torch.Tensor:
+    total = None
+    for key in RECON_LOSS_KEYS:
+        value = getattr(args, RECON_LOSS_ARG_NAMES[key]) * losses[f"{key}_per_sample"]
+        total = value if total is None else total + value
+    if total is None:
+        raise RuntimeError("No reconstruction loss terms were configured.")
+    return total
 
 
 def compute_elbo_terms(losses: Dict[str, torch.Tensor], args) -> Dict[str, torch.Tensor]:
@@ -1117,6 +1274,63 @@ def compute_elbo_terms(losses: Dict[str, torch.Tensor], args) -> Dict[str, torch
         "kl_term": kl_term,
         "elbo": elbo,
         "loss": -elbo,
+    }
+
+
+def compute_best_of_k_elbo_terms(
+    sample_losses: List[Dict[str, torch.Tensor]],
+    args,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    if not sample_losses:
+        raise ValueError("sample_losses must contain at least one sample.")
+
+    recon_per_sample = torch.stack(
+        [compute_reconstruction_nll_per_sample(losses, args) for losses in sample_losses],
+        dim=0,
+    )
+    best_indices = torch.argmin(recon_per_sample.detach(), dim=0)
+    gather_index = best_indices.view(1, -1)
+    best_recon_per_sample = recon_per_sample.gather(0, gather_index).squeeze(0)
+    mean_recon_per_sample = recon_per_sample.mean(dim=0)
+
+    combined: Dict[str, torch.Tensor] = {}
+    for key in RECON_LOSS_KEYS:
+        stacked = torch.stack([losses[f"{key}_per_sample"] for losses in sample_losses], dim=0)
+        selected = stacked.gather(0, gather_index).squeeze(0)
+        combined[f"{key}_per_sample"] = selected
+        combined[key] = selected.mean()
+
+    kl_z = torch.stack([losses["kl_z"] for losses in sample_losses]).mean()
+    kl_w = torch.stack([losses["kl_w"] for losses in sample_losses]).mean()
+    inst_kl = torch.stack([losses["inst_KL"] for losses in sample_losses]).mean()
+    combined["kl_z"] = kl_z
+    combined["kl_w"] = kl_w
+    combined["inst_KL"] = inst_kl
+    combined["kl_loss"] = kl_z + kl_w + inst_kl
+    combined["future_mask_mean"] = torch.stack([losses["future_mask_mean"] for losses in sample_losses]).mean()
+
+    best_recon_nll = best_recon_per_sample.mean()
+    mean_recon_nll = mean_recon_per_sample.mean()
+    aux_weight = float(args.best_of_k_aux_weight)
+    recon_nll = best_recon_nll + aux_weight * mean_recon_nll
+    recon_lhood = -recon_nll
+    kl_term = args.beta_kl * (kl_z + kl_w + inst_kl)
+    elbo = recon_lhood - kl_term
+
+    combined["best_of_k_best_recon_nll"] = best_recon_nll.detach()
+    combined["best_of_k_mean_recon_nll"] = mean_recon_nll.detach()
+    combined["best_of_k_aux_weight"] = best_recon_nll.new_tensor(aux_weight)
+    combined["best_of_k_mean_index"] = best_indices.to(best_recon_nll.dtype).mean()
+
+    return combined, {
+        "recon_nll": recon_nll,
+        "recon_lhood": recon_lhood,
+        "kl_term": kl_term,
+        "elbo": elbo,
+        "loss": -elbo,
+        "best_recon_nll": best_recon_nll,
+        "mean_recon_nll": mean_recon_nll,
+        "aux_recon_nll": aux_weight * mean_recon_nll,
     }
 
 def main():
@@ -1160,6 +1374,13 @@ def main():
     parser.add_argument("--lambda-joint", type=float, default=1.0)
     parser.add_argument("--lambda-vert", type=float, default=0.0)
     parser.add_argument("--lambda-vel", type=float, default=0.25)
+    parser.add_argument("--best-of-k", type=int, default=1, help="Number of stochastic trajectories sampled per batch for best-of-K training.")
+    parser.add_argument(
+        "--best-of-k-aux-weight",
+        type=float,
+        default=0.1,
+        help="Weight for the auxiliary mean reconstruction loss over all K samples when --best-of-k > 1.",
+    )
     parser.add_argument("--beta-kl", type=float, default=1e-4)
     parser.add_argument("--logdir", type=str, default="runs/ode2vae_hand")
     parser.add_argument("--resume-checkpoint", type=str, default=None, help="Path to a saved checkpoint to resume training from.")
@@ -1182,6 +1403,10 @@ def main():
         raise ValueError("--time-stride-aug-max must be positive.")
     if args.dynamics_damping < 0:
         raise ValueError("--dynamics-damping must be non-negative.")
+    if args.best_of_k <= 0:
+        raise ValueError("--best-of-k must be positive.")
+    if args.best_of_k_aux_weight < 0:
+        raise ValueError("--best-of-k-aux-weight must be non-negative.")
 
     train_dataset, val_dataset, train_loader, val_loader = build_dataloaders(args)
     logdir = Path(args.logdir).expanduser()
@@ -1342,20 +1567,34 @@ def main():
                 batch_start = time.time()
                 batch = move_tensor_dict_to_device(raw_batch, device)
 
-                outputs = model(
-                    batch,
-                    mano_right=mano_right,
-                    history_len=args.history_len,
-                    horizon=current_horizon,
-                    sample=True,
-                    method=args.method,
-                    future_discount=args.future_discount,
-                    need_verts=args.lambda_vert > 0.0,
-                )
-                if outputs is None:
-                    continue
-
-                elbo_terms = compute_elbo_terms(outputs, args)
+                if args.best_of_k > 1:
+                    sample_outputs = model.forward_samples(
+                        batch,
+                        mano_right=mano_right,
+                        num_samples=args.best_of_k,
+                        history_len=args.history_len,
+                        horizon=current_horizon,
+                        sample=True,
+                        method=args.method,
+                        future_discount=args.future_discount,
+                        need_verts=args.lambda_vert > 0.0,
+                        sample_dynamics=False,
+                    )
+                    outputs, elbo_terms = compute_best_of_k_elbo_terms(sample_outputs, args)
+                else:
+                    outputs = model(
+                        batch,
+                        mano_right=mano_right,
+                        history_len=args.history_len,
+                        horizon=current_horizon,
+                        sample=True,
+                        method=args.method,
+                        future_discount=args.future_discount,
+                        need_verts=args.lambda_vert > 0.0,
+                    )
+                    if outputs is None:
+                        continue
+                    elbo_terms = compute_elbo_terms(outputs, args)
                 loss = elbo_terms["loss"]
                 optimizer.zero_grad()
                 loss.backward()
@@ -1391,6 +1630,19 @@ def main():
                 writer.add_scalar("train/horizon", current_horizon, global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 writer.add_scalar("train/batch_time", batch_time, global_step)
+                if args.best_of_k > 1:
+                    writer.add_scalar("train/best_of_k_best_recon_nll", elbo_terms["best_recon_nll"].item(), global_step)
+                    writer.add_scalar("train/best_of_k_mean_recon_nll", elbo_terms["mean_recon_nll"].item(), global_step)
+                    writer.add_scalar("train/best_of_k_aux_recon_nll", elbo_terms["aux_recon_nll"].item(), global_step)
+                    writer.add_scalar("train/best_of_k_mean_index", outputs["best_of_k_mean_index"].item(), global_step)
+
+                best_of_k_msg = ""
+                if args.best_of_k > 1:
+                    best_of_k_msg = (
+                        f" K:{args.best_of_k} best_rec:{elbo_terms['best_recon_nll'].item():7.4f} "
+                        f"mean_rec:{elbo_terms['mean_recon_nll'].item():7.4f} "
+                        f"aux:{elbo_terms['aux_recon_nll'].item():7.4f}"
+                    )
 
                 log(
                     f"Epoch:{epoch:03d} Step:{step:04d} H:{current_horizon:02d} "
@@ -1400,7 +1652,8 @@ def main():
                     f"nu:{outputs['nu_loss'].item():7.4f} omega:{outputs['omega_loss'].item():7.4f} "
                     f"joint:{outputs['joint_loss'].item():7.4f} vel:{outputs['vel_loss'].item():7.4f} "
                     f"kl_z:{outputs['kl_z'].item():7.4f} kl_w:{outputs['kl_w'].item():7.4f} "
-                    f"inst_KL:{outputs['inst_KL'].item():7.4f} kl_term:{elbo_terms['kl_term'].item():7.4f} "
+                    f"inst_KL:{outputs['inst_KL'].item():7.4f} kl_term:{elbo_terms['kl_term'].item():7.4f}"
+                    f"{best_of_k_msg} "
                     f"batch_time:{batch_time:6.2f}s epoch_elapsed:{epoch_elapsed:7.2f}s "
                     f"epoch_eta:{eta_seconds:7.2f}s"
                 )
