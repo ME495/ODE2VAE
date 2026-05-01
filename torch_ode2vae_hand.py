@@ -865,6 +865,22 @@ class ODE2VAEHand(nn.Module):
         pred_joint_vel, joint_pair_mask = path_differences(pred_path_joints, path_mask, future_dt)
         gt_joint_vel, _ = path_differences(gt_path_joints, path_mask, future_dt)
 
+        boundary_dt = future_dt[:, :1].clamp_min(1e-6)
+        boundary_mask = path_mask[:, :2]
+        boundary_valid = ((boundary_mask[:, 0] > 0) & (boundary_mask[:, 1] > 0)).to(pred_joints_future.dtype)
+        pred_boundary_joint_vel = (pred_joints_future[:, 0] - gt_path_joints[:, 0]) / boundary_dt.unsqueeze(-1)
+        gt_boundary_joint_vel = (gt_joints_future[:, 0] - gt_path_joints[:, 0]) / boundary_dt.unsqueeze(-1)
+        boundary_vel_error = smooth_l1_feature_mean(
+            pred_boundary_joint_vel,
+            gt_boundary_joint_vel,
+            dim=(-1, -2),
+        )
+        boundary_vel_loss_per_sample = weighted_mean_per_sample(
+            boundary_vel_error.unsqueeze(1),
+            boundary_valid.unsqueeze(1),
+        )
+        boundary_vel_loss = weighted_mean(boundary_vel_error, boundary_valid)
+
         vel_loss_per_sample = (
             weighted_mean_per_sample(smooth_l1_feature_mean(pred_pose_vel, gt_pose_vel, dim=-1), pose_pair_mask)
             + weighted_mean_per_sample(smooth_l1_feature_mean(pred_trans_vel, gt_trans_vel, dim=-1), trans_pair_mask)
@@ -908,6 +924,8 @@ class ODE2VAEHand(nn.Module):
             "joint_loss_per_sample": joint_loss_per_sample,
             "vert_loss": vert_loss,
             "vert_loss_per_sample": vert_loss_per_sample,
+            "boundary_vel_loss": boundary_vel_loss,
+            "boundary_vel_loss_per_sample": boundary_vel_loss_per_sample,
             "vel_loss": vel_loss,
             "vel_loss_per_sample": vel_loss_per_sample,
             "kl_z": kl_z,
@@ -1229,6 +1247,7 @@ RECON_LOSS_KEYS = (
     "pose_loss",
     "joint_loss",
     "vert_loss",
+    "boundary_vel_loss",
     "vel_loss",
 )
 
@@ -1242,6 +1261,7 @@ RECON_LOSS_ARG_NAMES = {
     "pose_loss": "lambda_pose",
     "joint_loss": "lambda_joint",
     "vert_loss": "lambda_vert",
+    "boundary_vel_loss": "lambda_boundary_vel",
     "vel_loss": "lambda_vel",
 }
 
@@ -1373,6 +1393,7 @@ def main():
     parser.add_argument("--lambda-pose", type=float, default=1.0)
     parser.add_argument("--lambda-joint", type=float, default=1.0)
     parser.add_argument("--lambda-vert", type=float, default=0.0)
+    parser.add_argument("--lambda-boundary-vel", type=float, default=0.0)
     parser.add_argument("--lambda-vel", type=float, default=0.25)
     parser.add_argument("--best-of-k", type=int, default=1, help="Number of stochastic trajectories sampled per batch for best-of-K training.")
     parser.add_argument(
@@ -1621,6 +1642,7 @@ def main():
                 writer.add_scalar("train/pose_loss", outputs["pose_loss"].item(), global_step)
                 writer.add_scalar("train/joint_loss", outputs["joint_loss"].item(), global_step)
                 writer.add_scalar("train/vert_loss", outputs["vert_loss"].item(), global_step)
+                writer.add_scalar("train/boundary_vel_loss", outputs["boundary_vel_loss"].item(), global_step)
                 writer.add_scalar("train/vel_loss", outputs["vel_loss"].item(), global_step)
                 writer.add_scalar("train/kl_z", outputs["kl_z"].item(), global_step)
                 writer.add_scalar("train/kl_w", outputs["kl_w"].item(), global_step)
@@ -1650,7 +1672,8 @@ def main():
                     f"lhood:{elbo_terms['recon_lhood'].item():8.4f} dp:{outputs['delta_p_loss'].item():7.4f} "
                     f"root:{outputs['root_rot_loss'].item():7.4f} pose:{outputs['pose_loss'].item():7.4f} "
                     f"nu:{outputs['nu_loss'].item():7.4f} omega:{outputs['omega_loss'].item():7.4f} "
-                    f"joint:{outputs['joint_loss'].item():7.4f} vel:{outputs['vel_loss'].item():7.4f} "
+                    f"joint:{outputs['joint_loss'].item():7.4f} bvel:{outputs['boundary_vel_loss'].item():7.4f} "
+                    f"vel:{outputs['vel_loss'].item():7.4f} "
                     f"kl_z:{outputs['kl_z'].item():7.4f} kl_w:{outputs['kl_w'].item():7.4f} "
                     f"inst_KL:{outputs['inst_KL'].item():7.4f} kl_term:{elbo_terms['kl_term'].item():7.4f}"
                     f"{best_of_k_msg} "
