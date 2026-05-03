@@ -129,7 +129,7 @@ def mse_feature_mean(pred: torch.Tensor, target: torch.Tensor, dim) -> torch.Ten
 
 
 def smooth_l1_feature_mean(pred: torch.Tensor, target: torch.Tensor, dim) -> torch.Tensor:
-    return F.smooth_l1_loss(pred, target, reduction="none").mean(dim=dim)
+    return F.smooth_l1_loss(pred, target, reduction="none", beta=0.001).mean(dim=dim)
 
 
 def path_differences(
@@ -842,28 +842,30 @@ class ODE2VAEHand(nn.Module):
         pred_path_root = torch.cat([init_state["root0_6d"].unsqueeze(1), pred_root_future], dim=1)
         pred_path_pose = torch.cat([init_state["pose0"].unsqueeze(1), pred_pose_future], dim=1)
         pred_path_trans = torch.cat([torch.zeros_like(pred_delta_p_future[:, :1]), pred_delta_p_future], dim=1)
-        pred_path_shape = targets["anchor_shape"].unsqueeze(1).expand(-1, horizon + 1, -1)
-        pred_path_joints, _ = self._mano_forward(
-            pred_path_pose,
-            pred_path_root,
-            pred_path_trans,
-            pred_path_shape,
-            mano_right,
-            return_verts=False,
-        )
 
         gt_path_pose = targets["pose"][:, anchor_idx : anchor_idx + horizon + 1]
         gt_path_trans = targets["trans_rel"][:, anchor_idx : anchor_idx + horizon + 1]
         gt_path_joints = targets["joints"][:, anchor_idx : anchor_idx + horizon + 1]
         path_mask = targets["mask"][:, anchor_idx : anchor_idx + horizon + 1]
         future_dt = targets["future_dt"]
+        pred_visual_path_joints = torch.cat([gt_path_joints[:, :1], pred_joints_future], dim=1)
 
         pred_pose_vel, pose_pair_mask = path_differences(pred_path_pose, path_mask, future_dt)
         gt_pose_vel, _ = path_differences(gt_path_pose, path_mask, future_dt)
         pred_trans_vel, trans_pair_mask = path_differences(pred_path_trans, path_mask, future_dt)
         gt_trans_vel, _ = path_differences(gt_path_trans, path_mask, future_dt)
-        pred_joint_vel, joint_pair_mask = path_differences(pred_path_joints, path_mask, future_dt)
+        pred_joint_vel, joint_pair_mask = path_differences(pred_visual_path_joints, path_mask, future_dt)
         gt_joint_vel, _ = path_differences(gt_path_joints, path_mask, future_dt)
+        pred_joint_speed = torch.linalg.norm(pred_joint_vel, dim=-1).mean(dim=-1)
+        gt_joint_speed = torch.linalg.norm(gt_joint_vel, dim=-1).mean(dim=-1)
+        speed_mag_error = F.smooth_l1_loss(
+            pred_joint_speed,
+            gt_joint_speed,
+            reduction="none",
+            beta=0.001,
+        )
+        speed_mag_loss_per_sample = weighted_mean_per_sample(speed_mag_error, joint_pair_mask)
+        speed_mag_loss = weighted_mean(speed_mag_error, joint_pair_mask)
 
         boundary_dt = future_dt[:, :1].clamp_min(1e-6)
         boundary_mask = path_mask[:, :2]
@@ -926,6 +928,8 @@ class ODE2VAEHand(nn.Module):
             "vert_loss_per_sample": vert_loss_per_sample,
             "boundary_vel_loss": boundary_vel_loss,
             "boundary_vel_loss_per_sample": boundary_vel_loss_per_sample,
+            "speed_mag_loss": speed_mag_loss,
+            "speed_mag_loss_per_sample": speed_mag_loss_per_sample,
             "vel_loss": vel_loss,
             "vel_loss_per_sample": vel_loss_per_sample,
             "kl_z": kl_z,
@@ -1248,6 +1252,7 @@ RECON_LOSS_KEYS = (
     "joint_loss",
     "vert_loss",
     "boundary_vel_loss",
+    "speed_mag_loss",
     "vel_loss",
 )
 
@@ -1262,6 +1267,7 @@ RECON_LOSS_ARG_NAMES = {
     "joint_loss": "lambda_joint",
     "vert_loss": "lambda_vert",
     "boundary_vel_loss": "lambda_boundary_vel",
+    "speed_mag_loss": "lambda_speed_mag",
     "vel_loss": "lambda_vel",
 }
 
@@ -1394,6 +1400,7 @@ def main():
     parser.add_argument("--lambda-joint", type=float, default=1.0)
     parser.add_argument("--lambda-vert", type=float, default=0.0)
     parser.add_argument("--lambda-boundary-vel", type=float, default=0.0)
+    parser.add_argument("--lambda-speed-mag", type=float, default=0.0)
     parser.add_argument("--lambda-vel", type=float, default=0.25)
     parser.add_argument("--best-of-k", type=int, default=1, help="Number of stochastic trajectories sampled per batch for best-of-K training.")
     parser.add_argument(
@@ -1643,6 +1650,7 @@ def main():
                 writer.add_scalar("train/joint_loss", outputs["joint_loss"].item(), global_step)
                 writer.add_scalar("train/vert_loss", outputs["vert_loss"].item(), global_step)
                 writer.add_scalar("train/boundary_vel_loss", outputs["boundary_vel_loss"].item(), global_step)
+                writer.add_scalar("train/speed_mag_loss", outputs["speed_mag_loss"].item(), global_step)
                 writer.add_scalar("train/vel_loss", outputs["vel_loss"].item(), global_step)
                 writer.add_scalar("train/kl_z", outputs["kl_z"].item(), global_step)
                 writer.add_scalar("train/kl_w", outputs["kl_w"].item(), global_step)
@@ -1673,7 +1681,7 @@ def main():
                     f"root:{outputs['root_rot_loss'].item():7.4f} pose:{outputs['pose_loss'].item():7.4f} "
                     f"nu:{outputs['nu_loss'].item():7.4f} omega:{outputs['omega_loss'].item():7.4f} "
                     f"joint:{outputs['joint_loss'].item():7.4f} bvel:{outputs['boundary_vel_loss'].item():7.4f} "
-                    f"vel:{outputs['vel_loss'].item():7.4f} "
+                    f"smag:{outputs['speed_mag_loss'].item():7.4f} vel:{outputs['vel_loss'].item():7.4f} "
                     f"kl_z:{outputs['kl_z'].item():7.4f} kl_w:{outputs['kl_w'].item():7.4f} "
                     f"inst_KL:{outputs['inst_KL'].item():7.4f} kl_term:{elbo_terms['kl_term'].item():7.4f}"
                     f"{best_of_k_msg} "
