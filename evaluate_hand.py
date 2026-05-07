@@ -56,7 +56,20 @@ def build_model(dataset: GigaHandDataset, checkpoint_args: Dict, checkpoint: Dic
         horizon=int(checkpoint_args.get("horizon", 5)),
         dynamics_damping=float(checkpoint_args.get("dynamics_damping", 0.05)),
     ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    incompatible = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    missing = list(incompatible.missing_keys)
+    unexpected = list(incompatible.unexpected_keys)
+    disallowed_missing = [key for key in missing if not key.startswith("dpose_decoder.")]
+    if disallowed_missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint is incompatible with ODE2VAEHand. "
+            f"missing={disallowed_missing}, unexpected={unexpected}"
+        )
+    if missing:
+        print(
+            "Loaded checkpoint without dpose decoder weights; "
+            "dpose_decoder remains randomly initialized for compatibility with older checkpoints."
+        )
     model.eval()
     return model
 

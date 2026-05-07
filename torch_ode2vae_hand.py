@@ -286,11 +286,12 @@ class ODE2VAEHand(nn.Module):
         if self.pose_dim <= 0 or self.pose_dim % 6 != 0:
             raise ValueError(f"Invalid pose_dim inferred from input_dim={input_dim}. Expected motion = Rh(6) + pose(6*k) + Th(3).")
         self.num_pose_joints = self.pose_dim // 6
+        self.dpose_dim = 3 * self.num_pose_joints
         self.state_dim = self.latent_dim
         self.vel_dim = self.latent_dim + 6
         self.feature_dim = (
             self.pose_dim
-            + 3 * self.num_pose_joints
+            + self.dpose_dim
             + 3 * self.num_joints
             + 3 * self.num_joints
             + 1
@@ -308,6 +309,15 @@ class ODE2VAEHand(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, self.pose_dim),
+        )
+        self.dpose_decoder = nn.Sequential(
+            nn.Linear(self.latent_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.dpose_dim),
         )
         self.dynamics = BayesianDynamics(
             self.latent_dim * 2 + 6,
@@ -467,16 +477,40 @@ class ODE2VAEHand(nn.Module):
         dt: torch.Tensor,
         valid: torch.Tensor,
     ) -> torch.Tensor:
+        n = pose.shape[0]
+        omega, _ = self._pose_angular_velocity_pairs(pose, dt, valid)
+        zero = torch.zeros(n, 1, self.dpose_dim, device=pose.device, dtype=pose.dtype)
+        return torch.cat([zero, omega], dim=1)
+
+    def _pose_angular_velocity_targets(
+        self,
+        pose: torch.Tensor,
+        dt: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        n = pose.shape[0]
+        omega, pair_valid = self._pose_angular_velocity_pairs(pose, dt, valid)
+        zero = torch.zeros(n, 1, self.dpose_dim, device=pose.device, dtype=pose.dtype)
+        zero_mask = torch.zeros(n, 1, device=pose.device, dtype=pose.dtype)
+        return torch.cat([zero, omega], dim=1), torch.cat([zero_mask, pair_valid], dim=1)
+
+    def _pose_angular_velocity_pairs(
+        self,
+        pose: torch.Tensor,
+        dt: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         n, total_len, _ = pose.shape
         if total_len < 2:
-            return torch.zeros(n, total_len, self.num_pose_joints * 3, device=pose.device, dtype=pose.dtype)
+            omega = torch.zeros(n, 0, self.dpose_dim, device=pose.device, dtype=pose.dtype)
+            pair_valid = torch.zeros(n, 0, device=pose.device, dtype=pose.dtype)
+            return omega, pair_valid
         pose_mat = rot6d_rowmajor_to_matrix(pose.reshape(n, total_len, self.num_pose_joints, 6))
         rel_step = pose_mat[:, :-1].transpose(-1, -2) @ pose_mat[:, 1:]
         omega = matrix_to_axis_angle(rel_step) / dt.view(n, total_len - 1, 1, 1).clamp_min(1e-6)
         pair_valid = ((valid[:, 1:] > 0) & (valid[:, :-1] > 0)).to(pose.dtype)
         omega = omega * pair_valid.unsqueeze(-1).unsqueeze(-1)
-        zero = torch.zeros(n, 1, self.num_pose_joints, 3, device=pose.device, dtype=pose.dtype)
-        return torch.cat([zero, omega], dim=1).reshape(n, total_len, self.num_pose_joints * 3)
+        return omega.reshape(n, total_len - 1, self.dpose_dim), pair_valid
 
     def _history_features(
         self,
@@ -568,6 +602,9 @@ class ODE2VAEHand(nn.Module):
     def _decode_pose(self, h: torch.Tensor, hdot: torch.Tensor) -> torch.Tensor:
         return self.pose_decoder(torch.cat([h, hdot], dim=-1))
 
+    def _decode_dpose(self, h: torch.Tensor, hdot: torch.Tensor) -> torch.Tensor:
+        return self.dpose_decoder(torch.cat([h, hdot], dim=-1))
+
     def _pack_internal_state(
         self,
         h: torch.Tensor,
@@ -615,6 +652,10 @@ class ODE2VAEHand(nn.Module):
             h_future.reshape(-1, self.latent_dim),
             hdot_future.reshape(-1, self.latent_dim),
         ).reshape(z0.shape[0], horizon, self.pose_dim)
+        dpose_future = self._decode_dpose(
+            h_future.reshape(-1, self.latent_dim),
+            hdot_future.reshape(-1, self.latent_dim),
+        ).reshape(z0.shape[0], horizon, self.dpose_dim)
 
         root_seq: List[torch.Tensor] = []
         delta_p_seq: List[torch.Tensor] = []
@@ -650,6 +691,7 @@ class ODE2VAEHand(nn.Module):
             "z_future": z_traj[:, 1:],
             "root_future": torch.stack(root_seq, dim=1),
             "pose_future": pose_future,
+            "dpose_future": dpose_future,
             "nu_interval": nu_interval,
             "omega_interval": omega_interval,
             "delta_p_future": torch.stack(delta_p_seq, dim=1),
@@ -768,11 +810,14 @@ class ODE2VAEHand(nn.Module):
         gt_delta_p_future = targets["trans_rel"][:, history_len : history_len + horizon]
         gt_nu_future = targets["root_nu"][:, history_len : history_len + horizon]
         gt_omega_future = targets["root_omega"][:, history_len : history_len + horizon]
+        gt_dpose_future = targets["dpose"][:, history_len : history_len + horizon]
+        dpose_mask_future = targets["dpose_mask"][:, history_len : history_len + horizon]
         gt_joints_future = targets["joints"][:, history_len : history_len + horizon]
         gt_verts_future = None if targets["verts"] is None else targets["verts"][:, history_len : history_len + horizon]
 
         pred_root_future = rollout["root_future"]
         pred_pose_future = rollout["pose_future"]
+        pred_dpose_future = rollout["dpose_future"]
         pred_delta_p_future = rollout["delta_p_future"]
         pred_nu_future = rollout["nu_interval"]
         pred_omega_future = rollout["omega_interval"]
@@ -822,6 +867,11 @@ class ODE2VAEHand(nn.Module):
         omega_error = smooth_l1_feature_mean(pred_omega_future, gt_omega_future, dim=-1)
         omega_loss_per_sample = weighted_mean_per_sample(omega_error, future_weights)
         omega_loss = weighted_mean(omega_error, future_weights)
+        dpose_weights = future_discount ** torch.arange(horizon, device=dpose_mask_future.device, dtype=dpose_mask_future.dtype)
+        dpose_weights = dpose_weights.view(1, -1) * dpose_mask_future
+        dpose_error = smooth_l1_feature_mean(pred_dpose_future, gt_dpose_future, dim=-1)
+        dpose_loss_per_sample = weighted_mean_per_sample(dpose_error, dpose_weights)
+        dpose_loss = weighted_mean(dpose_error, dpose_weights)
 
         joint_error = smooth_l1_feature_mean(pred_joints_future, gt_joints_future, dim=(-1, -2))
         joint_loss_per_sample = weighted_mean_per_sample(joint_error, future_weights)
@@ -849,6 +899,15 @@ class ODE2VAEHand(nn.Module):
         path_mask = targets["mask"][:, anchor_idx : anchor_idx + horizon + 1]
         future_dt = targets["future_dt"]
         pred_visual_path_joints = torch.cat([gt_path_joints[:, :1], pred_joints_future], dim=1)
+
+        # Keep this consistency term fully differentiable through both decoder branches:
+        # pred_pose shapes the SO(3) finite-difference target, and pred_dpose must match it.
+        dpose_from_pose, dpose_cons_mask = self._pose_angular_velocity_pairs(pred_path_pose, future_dt, path_mask)
+        dpose_cons_weights = future_discount ** torch.arange(horizon, device=dpose_cons_mask.device, dtype=dpose_cons_mask.dtype)
+        dpose_cons_weights = dpose_cons_weights.view(1, -1) * dpose_cons_mask
+        dpose_cons_error = smooth_l1_feature_mean(pred_dpose_future, dpose_from_pose, dim=-1)
+        dpose_cons_loss_per_sample = weighted_mean_per_sample(dpose_cons_error, dpose_cons_weights)
+        dpose_cons_loss = weighted_mean(dpose_cons_error, dpose_cons_weights)
 
         pred_pose_vel, pose_pair_mask = path_differences(pred_path_pose, path_mask, future_dt)
         gt_pose_vel, _ = path_differences(gt_path_pose, path_mask, future_dt)
@@ -920,6 +979,10 @@ class ODE2VAEHand(nn.Module):
             "nu_loss_per_sample": nu_loss_per_sample,
             "omega_loss": omega_loss,
             "omega_loss_per_sample": omega_loss_per_sample,
+            "dpose_loss": dpose_loss,
+            "dpose_loss_per_sample": dpose_loss_per_sample,
+            "dpose_cons_loss": dpose_cons_loss,
+            "dpose_cons_loss_per_sample": dpose_cons_loss_per_sample,
             "pose_loss": pose_loss,
             "pose_loss_per_sample": pose_loss_per_sample,
             "joint_loss": joint_loss,
@@ -941,6 +1004,9 @@ class ODE2VAEHand(nn.Module):
             "future_mask_mean": future_mask.mean(),
             "pred_joint_error": joint_loss.detach(),
             "pred_motion": torch.cat([pred_root_future, pred_pose_future, pred_delta_p_future], dim=-1),
+            "pred_dpose": pred_dpose_future,
+            "dpose_gt": gt_dpose_future,
+            "dpose_mask": dpose_mask_future,
             "pred_joints_future": pred_joints_future,
             "gt_joints_future": gt_joints_future,
             "future_mask": future_mask,
@@ -986,6 +1052,12 @@ class ODE2VAEHand(nn.Module):
             targets["trans_rel"],
             mask,
             times,
+        )
+        full_dt = (times[:, 1:] - times[:, :-1]).clamp_min(1e-6)
+        targets["dpose"], targets["dpose_mask"] = self._pose_angular_velocity_targets(
+            pose=pose,
+            dt=full_dt,
+            valid=mask,
         )
         history = self._history_features(
             pose=pose,
@@ -1248,6 +1320,8 @@ RECON_LOSS_KEYS = (
     "root_rot_loss",
     "nu_loss",
     "omega_loss",
+    "dpose_loss",
+    "dpose_cons_loss",
     "pose_loss",
     "joint_loss",
     "vert_loss",
@@ -1263,6 +1337,8 @@ RECON_LOSS_ARG_NAMES = {
     "root_rot_loss": "lambda_root_rot",
     "nu_loss": "lambda_nu",
     "omega_loss": "lambda_omega",
+    "dpose_loss": "lambda_dpose",
+    "dpose_cons_loss": "lambda_dpose_cons",
     "pose_loss": "lambda_pose",
     "joint_loss": "lambda_joint",
     "vert_loss": "lambda_vert",
@@ -1396,6 +1472,8 @@ def main():
     parser.add_argument("--lambda-root-rot", type=float, default=1.0)
     parser.add_argument("--lambda-nu", type=float, default=1.0)
     parser.add_argument("--lambda-omega", type=float, default=1.0)
+    parser.add_argument("--lambda-dpose", type=float, default=0.1)
+    parser.add_argument("--lambda-dpose-cons", type=float, default=0.05)
     parser.add_argument("--lambda-pose", type=float, default=1.0)
     parser.add_argument("--lambda-joint", type=float, default=1.0)
     parser.add_argument("--lambda-vert", type=float, default=0.0)
@@ -1646,6 +1724,8 @@ def main():
                 writer.add_scalar("train/root_rot_loss", outputs["root_rot_loss"].item(), global_step)
                 writer.add_scalar("train/nu_loss", outputs["nu_loss"].item(), global_step)
                 writer.add_scalar("train/omega_loss", outputs["omega_loss"].item(), global_step)
+                writer.add_scalar("train/loss_dpose", outputs["dpose_loss"].item(), global_step)
+                writer.add_scalar("train/loss_dpose_cons", outputs["dpose_cons_loss"].item(), global_step)
                 writer.add_scalar("train/pose_loss", outputs["pose_loss"].item(), global_step)
                 writer.add_scalar("train/joint_loss", outputs["joint_loss"].item(), global_step)
                 writer.add_scalar("train/vert_loss", outputs["vert_loss"].item(), global_step)
@@ -1680,6 +1760,7 @@ def main():
                     f"lhood:{elbo_terms['recon_lhood'].item():8.4f} dp:{outputs['delta_p_loss'].item():7.4f} "
                     f"root:{outputs['root_rot_loss'].item():7.4f} pose:{outputs['pose_loss'].item():7.4f} "
                     f"nu:{outputs['nu_loss'].item():7.4f} omega:{outputs['omega_loss'].item():7.4f} "
+                    f"loss_dpose:{outputs['dpose_loss'].item():7.4f} loss_dpose_cons:{outputs['dpose_cons_loss'].item():7.4f} "
                     f"joint:{outputs['joint_loss'].item():7.4f} bvel:{outputs['boundary_vel_loss'].item():7.4f} "
                     f"smag:{outputs['speed_mag_loss'].item():7.4f} vel:{outputs['vel_loss'].item():7.4f} "
                     f"kl_z:{outputs['kl_z'].item():7.4f} kl_w:{outputs['kl_w'].item():7.4f} "
