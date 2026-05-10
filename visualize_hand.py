@@ -186,19 +186,6 @@ def select_window(
     return clipped
 
 
-def build_targets(model, clip_batch: Dict[str, torch.Tensor], mano_right, need_verts: bool) -> Dict[str, torch.Tensor]:
-    return model._build_local_targets(
-        pose=clip_batch["pose"],
-        rh=clip_batch["Rh"],
-        th=clip_batch["Th"],
-        shape=clip_batch["shape"],
-        mask=clip_batch["mask"],
-        history_len=model.history_len,
-        mano_right=mano_right,
-        need_verts=need_verts,
-    )
-
-
 def predict_outputs(
     model,
     clip_batch: Dict[str, torch.Tensor],
@@ -210,28 +197,13 @@ def predict_outputs(
 ) -> Dict[str, torch.Tensor]:
     history_len = model.history_len
     horizon = model.horizon
-    targets = build_targets(model, clip_batch, mano_right, need_verts=need_verts)
-    targets["pose"] = clip_batch["pose"]
-    targets["times"] = clip_batch["times"]
-    targets["root_nu"], targets["root_omega"] = model._root_velocity_targets(
-        targets["root_rel_mat"],
-        targets["trans_rel"],
-        clip_batch["mask"],
-        clip_batch["times"],
-    )
-    history = model._history_features(
-        pose=clip_batch["pose"],
-        joints_rel=targets["joints_rel"],
-        joint_delta=targets["joint_delta"],
-        mask=clip_batch["mask"],
-        times=clip_batch["times"],
+    targets, stats = model._prepare_forward_context(
+        batch=clip_batch,
+        mano_right=mano_right,
         history_len=history_len,
+        horizon=horizon,
+        need_verts=need_verts,
     )
-    targets["future_dt"] = (
-        clip_batch["times"][:, history_len : history_len + horizon]
-        - clip_batch["times"][:, history_len - 1 : history_len + horizon - 1]
-    ).clamp_min(1e-6)
-    stats = model._encode_initial_distribution(history_feature=history["feature"])
     init_state = model._sample_initial_state(stats, sample=sample_initial)
     rollout = model._rollout(
         init_state,

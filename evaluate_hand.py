@@ -204,6 +204,25 @@ def accumulate_dynamics_curves(
                             jerk_counts[frame_idx] += int(frame_valid.sum().item())
 
 
+def select_best_of_k_outputs(sample_outputs: List[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not sample_outputs:
+        raise ValueError("sample_outputs must contain at least one sample.")
+    pred_joints = torch.stack([outputs["pred_joints_future"] for outputs in sample_outputs], dim=0)
+    gt_joints = sample_outputs[0]["gt_joints_future"]
+    future_mask = sample_outputs[0]["future_mask"]
+
+    joint_error = torch.linalg.norm(pred_joints - gt_joints.unsqueeze(0), dim=-1).mean(dim=-1)
+    weights = future_mask.to(joint_error.dtype).unsqueeze(0)
+    denom = weights.sum(dim=-1).clamp_min(1e-6)
+    window_error = (joint_error * weights).sum(dim=-1) / denom
+    best_indices = torch.argmin(window_error, dim=0)
+
+    _, batch_size, horizon, num_joints, xyz_dim = pred_joints.shape
+    gather_index = best_indices.view(1, batch_size, 1, 1, 1).expand(1, batch_size, horizon, num_joints, xyz_dim)
+    best_pred_joints = pred_joints.gather(0, gather_index).squeeze(0)
+    return best_pred_joints, gt_joints, future_mask, best_indices
+
+
 def summarize_curve(values: np.ndarray, prefix: str) -> Dict[str, float]:
     data = np.asarray(values, dtype=np.float64)
     if data.size == 0:
@@ -438,6 +457,8 @@ def evaluate(args: argparse.Namespace) -> Dict:
     baseline_acc_counts: List[int] = []
     baseline_jerk_sums: List[float] = []
     baseline_jerk_counts: List[int] = []
+    best_index_sum = 0.0
+    best_index_count = 0
 
     with torch.no_grad():
         progress = tqdm(loader, desc="Evaluating", unit="seq")
@@ -463,21 +484,38 @@ def evaluate(args: argparse.Namespace) -> Dict:
                     "shape": subsequences["shape"][start:end],
                 }
                 clip_batch = move_tensor_dict_to_device(clip_batch, device)
-                outputs = model(
-                    clip_batch,
-                    mano_right=mano_right,
-                    history_len=history_len,
-                    horizon=horizon,
-                    sample=False,
-                    method=method,
-                    future_discount=1.0,
-                    need_verts=False,
-                )
-                if outputs is None:
-                    continue
-                pred_joints = outputs["pred_joints_future"]
-                gt_joints = outputs["gt_joints_future"]
-                future_mask = outputs["future_mask"]
+                if args.best_of_k > 1:
+                    sample_outputs = model.forward_samples(
+                        clip_batch,
+                        mano_right=mano_right,
+                        num_samples=args.best_of_k,
+                        history_len=history_len,
+                        horizon=horizon,
+                        sample=True,
+                        method=method,
+                        future_discount=1.0,
+                        need_verts=False,
+                        sample_dynamics=True,
+                    )
+                    pred_joints, gt_joints, future_mask, best_indices = select_best_of_k_outputs(sample_outputs)
+                    best_index_sum += float(best_indices.to(torch.float32).sum().item())
+                    best_index_count += int(best_indices.numel())
+                else:
+                    outputs = model(
+                        clip_batch,
+                        mano_right=mano_right,
+                        history_len=history_len,
+                        horizon=horizon,
+                        sample=False,
+                        method=method,
+                        future_discount=1.0,
+                        need_verts=False,
+                    )
+                    if outputs is None:
+                        continue
+                    pred_joints = outputs["pred_joints_future"]
+                    gt_joints = outputs["gt_joints_future"]
+                    future_mask = outputs["future_mask"]
                 future_times = clip_batch["times"][:, history_len : history_len + horizon]
                 targets = model._build_local_targets(
                     pose=clip_batch["pose"],
@@ -585,6 +623,8 @@ def evaluate(args: argparse.Namespace) -> Dict:
         "horizon": horizon,
         "subseq_len": subseq_len,
         "stride": args.stride,
+        "best_of_k": args.best_of_k,
+        "best_of_k_mean_index": best_index_sum / max(best_index_count, 1) if args.best_of_k > 1 else 0.0,
         "counts": [counts[idx] for idx in range(len(errors_sum)) if counts[idx] > 0],
         "dynamics": dynamics_summary,
         "gt_dynamics": gt_dynamics_summary,
@@ -726,6 +766,8 @@ def evaluate(args: argparse.Namespace) -> Dict:
         "baseline_jerk_png_path": baseline_jerk_png_path,
         "num_sequences": len(dataset),
         "checkpoint_path": checkpoint_path,
+        "best_of_k": args.best_of_k,
+        "best_of_k_mean_index": best_index_sum / max(best_index_count, 1) if args.best_of_k > 1 else 0.0,
     }
 
 
@@ -741,12 +783,23 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=256)
+    parser.add_argument(
+        "--best-of-k",
+        type=int,
+        default=1,
+        help="Use oracle best-of-K stochastic rollouts per window. K=1 keeps the deterministic mean rollout.",
+    )
     args = parser.parse_args()
     if args.stride <= 0:
         raise ValueError("--stride must be positive")
+    if args.best_of_k <= 0:
+        raise ValueError("--best-of-k must be positive")
 
     result = evaluate(args)
     print(f"checkpoint: {result['checkpoint_path']}")
+    print(f"best_of_k: {result['best_of_k']}")
+    if result["best_of_k"] > 1:
+        print(f"best_of_k_mean_index: {result['best_of_k_mean_index']:.3f}")
     print(f"num_sequences: {result['num_sequences']}")
     print(f"num_frames_in_curve: {len(result['frame_numbers'])}")
     print(f"frame_1_mpjpe_mm: {result['mpjpe_mm'][0]:.3f}")
