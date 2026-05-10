@@ -4,10 +4,10 @@ set -eu
 
 DATASET_ROOT="/media/disk_16T_2026/dataset/GigaHands"
 SPLIT_DIR="runs/hand_motion_splits"
-LOGDIR="runs/ode2vae_hand_bnn_elbo16"
-GPU_ID="${CUDA_VISIBLE_DEVICES:-1}"
+LOGDIR="runs/ode2vae_hand_bnn_elbo17"
+GPU_ID="${CUDA_VISIBLE_DEVICES:-0}"
 METHOD="rk4"
-DYNAMICS_DAMPING="0.00"
+DYNAMICS_DAMPING="0.02"
 BETA_KL="1e-5"
 UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 
